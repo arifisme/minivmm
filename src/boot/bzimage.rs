@@ -12,8 +12,11 @@ const OFFSET_HEADER_MAGIC: usize = 0x202;
 const OFFSET_VERSION: usize = 0x206;
 const OFFSET_LOADFLAGS: usize = 0x211;
 const OFFSET_INITRD_ADDR_MAX: usize = 0x22c;
+const OFFSET_KERNEL_ALIGNMENT: usize = 0x230;
+const OFFSET_RELOCATABLE_KERNEL: usize = 0x234;
 const OFFSET_XLOADFLAGS: usize = 0x236;
 const OFFSET_CMDLINE_SIZE: usize = 0x238;
+const OFFSET_PREF_ADDRESS: usize = 0x258;
 const OFFSET_INIT_SIZE: usize = 0x260;
 
 const BOOT_FLAG: u16 = 0xaa55;
@@ -37,8 +40,10 @@ pub enum BootError {
     No64BitEntry,
     #[error("kernel is not a bzImage (not loaded high)")]
     NotLoadedHigh,
-    #[error("kernel needs {needed:#x} bytes but only {available:#x} fit below the MMIO gap")]
+    #[error("kernel needs memory up to {needed:#x} but low memory ends at {available:#x}")]
     KernelTooLarge { needed: u64, available: u64 },
+    #[error("kernel wants to run at {0:#x}, below the 1 MiB load address")]
+    UnsupportedRuntimeAddress(u64),
     #[error("command line is {len} bytes but the kernel accepts at most {max}")]
     CmdlineTooLong { len: usize, max: usize },
     #[error("command line contains a NUL byte")]
@@ -81,6 +86,10 @@ fn u32_at(image: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(image[offset..offset + 4].try_into().unwrap_or_default())
 }
 
+fn u64_at(image: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(image[offset..offset + 8].try_into().unwrap_or_default())
+}
+
 pub fn parse_header(image: &[u8]) -> Result<KernelHeader> {
     if image.len() < SETUP_HEADER_MAX_END {
         return Err(BootError::TooSmall);
@@ -119,24 +128,44 @@ fn setup_size(image: &[u8]) -> usize {
     (sects + 1) * SECTOR_SIZE
 }
 
+// init_size is measured from the address the kernel decompresses itself to, which the boot
+// protocol derives from pref_address and kernel_alignment rather than the load address.
+fn runtime_start(image: &[u8]) -> Option<u64> {
+    let pref_address = u64_at(image, OFFSET_PREF_ADDRESS);
+    if image[OFFSET_RELOCATABLE_KERNEL] == 0 {
+        return Some(pref_address);
+    }
+    let alignment = u64::from(u32_at(image, OFFSET_KERNEL_ALIGNMENT)).max(1);
+    KERNEL_START
+        .raw()
+        .max(pref_address)
+        .checked_next_multiple_of(alignment)
+}
+
 pub fn load_bzimage(mem: &GuestMemory, image: &[u8], low_mem_end: u64) -> Result<LoadedKernel> {
     let header = parse_header(image)?;
     let payload = image.get(setup_size(image)..).ok_or(BootError::TooSmall)?;
     if payload.is_empty() {
         return Err(BootError::TooSmall);
     }
-    let footprint = header.init_size.max(payload.len() as u64);
-    let available = low_mem_end.saturating_sub(KERNEL_START.raw());
-    if footprint > available {
+    let start = runtime_start(image);
+    if let Some(start) = start.filter(|start| *start < KERNEL_START.raw()) {
+        return Err(BootError::UnsupportedRuntimeAddress(start));
+    }
+    let payload_end = KERNEL_START.raw() + payload.len() as u64;
+    let end = start
+        .and_then(|start| start.checked_add(header.init_size))
+        .map_or(u64::MAX, |end| end.max(payload_end));
+    if end > low_mem_end {
         return Err(BootError::KernelTooLarge {
-            needed: footprint,
-            available,
+            needed: end,
+            available: low_mem_end,
         });
     }
     mem.write(KERNEL_START, payload)?;
     Ok(LoadedKernel {
         entry: GuestAddress(KERNEL_START.raw() + STARTUP_64_OFFSET),
-        end: GuestAddress(KERNEL_START.raw() + footprint),
+        end: GuestAddress(end),
         header,
     })
 }
@@ -160,6 +189,7 @@ pub(crate) mod tests {
         image[OFFSET_XLOADFLAGS..OFFSET_XLOADFLAGS + 2].copy_from_slice(&3u16.to_le_bytes());
         image[OFFSET_CMDLINE_SIZE..OFFSET_CMDLINE_SIZE + 4].copy_from_slice(&2047u32.to_le_bytes());
         image[OFFSET_INIT_SIZE..OFFSET_INIT_SIZE + 4].copy_from_slice(&0x10000u32.to_le_bytes());
+        set_runtime_address(&mut image, KERNEL_START.raw(), Some(0x1000));
         for (i, byte) in image[(setup_sects + 1) * SECTOR_SIZE..]
             .iter_mut()
             .enumerate()
@@ -167,6 +197,59 @@ pub(crate) mod tests {
             *byte = i as u8;
         }
         image
+    }
+
+    pub fn set_runtime_address(image: &mut [u8], pref_address: u64, alignment: Option<u32>) {
+        image[OFFSET_PREF_ADDRESS..OFFSET_PREF_ADDRESS + 8]
+            .copy_from_slice(&pref_address.to_le_bytes());
+        image[OFFSET_RELOCATABLE_KERNEL] = u8::from(alignment.is_some());
+        image[OFFSET_KERNEL_ALIGNMENT..OFFSET_KERNEL_ALIGNMENT + 4]
+            .copy_from_slice(&alignment.unwrap_or(0).to_le_bytes());
+    }
+
+    pub fn set_init_size(image: &mut [u8], init_size: u32) {
+        image[OFFSET_INIT_SIZE..OFFSET_INIT_SIZE + 4].copy_from_slice(&init_size.to_le_bytes());
+    }
+
+    #[test]
+    fn footprint_starts_at_the_runtime_address() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 0x4000000)]).unwrap();
+        let mut fixed = fake_bzimage(0x2000);
+        set_runtime_address(&mut fixed, 0x1000000, None);
+        let kernel = load_bzimage(&mem, &fixed, 0x4000000).unwrap();
+        assert_eq!(kernel.end, GuestAddress(0x1010000));
+
+        let mut relocatable = fake_bzimage(0x2000);
+        set_runtime_address(&mut relocatable, 0x1000000, Some(0x200000));
+        let kernel = load_bzimage(&mem, &relocatable, 0x4000000).unwrap();
+        assert_eq!(kernel.end, GuestAddress(0x1010000));
+
+        set_runtime_address(&mut relocatable, 0x100000, Some(0x200000));
+        let kernel = load_bzimage(&mem, &relocatable, 0x4000000).unwrap();
+        assert_eq!(kernel.end, GuestAddress(0x210000));
+
+        let mut large = fake_bzimage(0x100000);
+        set_runtime_address(&mut large, 0x100000, Some(0x1000));
+        set_init_size(&mut large, 0x1000);
+        let kernel = load_bzimage(&mem, &large, 0x4000000).unwrap();
+        assert_eq!(kernel.end, GuestAddress(0x200000));
+    }
+
+    #[test]
+    fn rejects_kernel_whose_runtime_area_does_not_fit() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 0x1800000)]).unwrap();
+        let mut image = fake_bzimage(0x2000);
+        set_runtime_address(&mut image, 0x1000000, None);
+        set_init_size(&mut image, 0x1000000);
+        assert!(matches!(
+            load_bzimage(&mem, &image, 0x1800000),
+            Err(BootError::KernelTooLarge { .. })
+        ));
+        set_runtime_address(&mut image, u64::MAX - 0x1000, Some(0x200000));
+        assert!(load_bzimage(&mem, &image, 0x1800000).is_err());
+        set_runtime_address(&mut image, 0x8000, None);
+        set_init_size(&mut image, 0x10000);
+        assert!(load_bzimage(&mem, &image, 0x1800000).is_err());
     }
 
     #[test]

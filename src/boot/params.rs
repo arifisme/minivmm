@@ -138,7 +138,8 @@ pub fn initrd_address(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boot::bzimage::{load_bzimage, parse_header, tests::fake_bzimage};
+    use crate::boot::bzimage::tests::{fake_bzimage, set_init_size, set_runtime_address};
+    use crate::boot::bzimage::{load_bzimage, parse_header};
 
     fn u32_at(page: &ZeroPage, offset: usize) -> u32 {
         u32::from_le_bytes(page.as_bytes()[offset..offset + 4].try_into().unwrap())
@@ -205,6 +206,23 @@ mod tests {
         assert_eq!(
             initrd_address(&capped, 0x1000, 0x1000000).unwrap(),
             GuestAddress(0x7ff000)
+        );
+    }
+
+    #[test]
+    fn initrd_stays_clear_of_the_kernel_runtime_area() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 0x4000000)]).unwrap();
+        let mut image = fake_bzimage(0x2000);
+        set_runtime_address(&mut image, 0x1000000, None);
+        set_init_size(&mut image, 0x1000000);
+        let kernel = load_bzimage(&mem, &image, 0x4000000).unwrap();
+        assert!(matches!(
+            initrd_address(&kernel, 40 << 20, 0x4000000),
+            Err(BootError::InitrdTooLarge(_))
+        ));
+        assert_eq!(
+            initrd_address(&kernel, 32 << 20, 0x4000000).unwrap(),
+            GuestAddress(0x2000000)
         );
     }
 }
