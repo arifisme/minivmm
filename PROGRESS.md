@@ -29,8 +29,18 @@
 ## Fuzzing
 Targets in `fuzz/`: `virtqueue`, `virtio_devices` (blk and net through the PCI transport),
 `device_registers` (UART, i8042, ACPI PM, PCI config space, virtio BAR), `api_json`,
-`bzimage`. Each ran locally for at least 5 minutes; CI runs each for 60 seconds on every
-push.
+`bzimage`. Local runs, none of which found a crash:
+
+| Target | Time | Executions |
+|---|---|---|
+| virtqueue (two input layouts) | 2 x 5 min | 16.1 M + 14.7 M |
+| virtio_devices | 5 min + 10 min | 2.7 M + 5.3 M |
+| device_registers | 5 min | 2.6 M |
+| api_json | 5 min | 28.0 M |
+| bzimage | 5 min | 14.8 M |
+
+CI runs every target for 60 seconds on each push. Hardening found by review rather than
+fuzzing: empty bus accesses are ignored and restored virtqueues are revalidated.
 
 ## Decisions
 - ACPI (RSDP/XSDT/FADT/FACS/DSDT/MADT) instead of MP tables: the MADT lists the CPUs and
