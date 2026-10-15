@@ -55,11 +55,9 @@ const COMMON_SYSCALLS: &[i64] = &[
     libc::SYS_read,
     libc::SYS_write,
     libc::SYS_futex,
-    libc::SYS_mmap,
     libc::SYS_munmap,
     libc::SYS_mremap,
     libc::SYS_madvise,
-    libc::SYS_mprotect,
     libc::SYS_brk,
     libc::SYS_rt_sigreturn,
     // The kernel resumes a timed wait interrupted by a stop and continue through this call.
@@ -149,6 +147,16 @@ fn ioctl_rules(requests: &[u64]) -> Result<Vec<SeccompRule>, SeccompError> {
         .collect()
 }
 
+fn non_executable_rule() -> Result<Vec<SeccompRule>, SeccompError> {
+    let condition = SeccompCondition::new(
+        2,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::MaskedEq(libc::PROT_EXEC as u64),
+        0,
+    )?;
+    Ok(vec![SeccompRule::new(vec![condition])?])
+}
+
 pub fn build_filter(kind: ThreadKind) -> Result<BpfProgram, SeccompError> {
     let (extra, ioctls) = match kind {
         ThreadKind::Vmm => (VMM_SYSCALLS, vmm_ioctls()),
@@ -160,6 +168,8 @@ pub fn build_filter(kind: ThreadKind) -> Result<BpfProgram, SeccompError> {
         .map(|syscall| (*syscall, Vec::new()))
         .collect();
     rules.insert(libc::SYS_ioctl, ioctl_rules(&ioctls)?);
+    rules.insert(libc::SYS_mmap, non_executable_rule()?);
+    rules.insert(libc::SYS_mprotect, non_executable_rule()?);
     let filter = SeccompFilter::new(
         rules,
         SeccompAction::Trap,
@@ -312,6 +322,54 @@ mod tests {
         };
         for kind in [ThreadKind::Vmm, ThreadKind::Vcpu] {
             assert_eq!(run_filtered_child(kind, wait, stop_and_continue), 0);
+        }
+    }
+
+    fn map_page(protection: libc::c_int) -> *mut libc::c_void {
+        // SAFETY: an anonymous private mapping with no address hint.
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                protection,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if page == libc::MAP_FAILED {
+            // SAFETY: exiting the forked child.
+            unsafe { libc::_exit(2) };
+        }
+        page
+    }
+
+    #[test]
+    fn executable_mappings_are_refused() {
+        let map_executable = || {
+            map_page(libc::PROT_READ | libc::PROT_EXEC);
+        };
+        let make_executable = || {
+            let page = map_page(libc::PROT_READ | libc::PROT_WRITE);
+            // SAFETY: changing the protection of the page mapped above.
+            unsafe { libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC) };
+        };
+        let make_writable = || {
+            let page = map_page(libc::PROT_READ);
+            // SAFETY: changing the protection of the page mapped above.
+            if unsafe { libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
+                // SAFETY: exiting the forked child.
+                unsafe { libc::_exit(3) };
+            }
+        };
+        for kind in [ThreadKind::Vmm, ThreadKind::Vcpu] {
+            for child in [map_executable, make_executable] {
+                assert_eq!(
+                    run_filtered_child(kind, child, |_| {}),
+                    BLOCKED_SYSCALL_EXIT_CODE
+                );
+            }
+            assert_eq!(run_filtered_child(kind, make_writable, |_| {}), 0);
         }
     }
 }

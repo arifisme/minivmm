@@ -172,8 +172,9 @@ TAP device must still exist and the disk must not have been modified in between.
   configuration space, MSI-X table, transport registers and virtqueue indices.
 - **Seccomp.** Before entering their loops, the main thread and each vCPU thread
   install their own BPF filter (built with seccompiler). `ioctl` is restricted to the
-  request numbers each thread type needs; any other syscall raises SIGSYS, whose handler
-  reports the syscall number and exits.
+  request numbers each thread type needs and `mmap`/`mprotect` cannot create executable
+  memory; any other syscall raises SIGSYS, whose handler reports the syscall number and
+  exits.
 
 Source layout: `src/memory.rs` (guest memory), `src/arch` (layout, GDT, paging,
 registers, CPUID, ACPI/AML), `src/boot` (bzImage loader, zero page), `src/kvm` (VM,
