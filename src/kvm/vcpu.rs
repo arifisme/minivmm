@@ -301,7 +301,11 @@ impl Vcpu {
         KickTarget::new(self.fd.get_kvm_run())
     }
 
-    pub fn run(mut self, requests: Receiver<VcpuRequest>, responses: Sender<(u8, VcpuResponse)>) {
+    pub fn run(
+        mut self,
+        requests: Receiver<(u64, VcpuRequest)>,
+        responses: Sender<(u8, u64, VcpuResponse)>,
+    ) {
         // Locals drop before `self`, so even when unwinding the kick handler is detached
         // before the kvm_run mapping goes away.
         let kick_target = self.kick_target();
@@ -320,7 +324,7 @@ impl Vcpu {
                     Err(TryRecvError::Disconnected) => break,
                 }
             };
-            if let Some(request) = request {
+            if let Some((sequence, request)) = request {
                 let response = match request {
                     VcpuRequest::Pause => {
                         if !paused {
@@ -339,7 +343,7 @@ impl Vcpu {
                     },
                     VcpuRequest::Stop => break,
                 };
-                if responses.send((self.index, response)).is_err() {
+                if responses.send((self.index, sequence, response)).is_err() {
                     break;
                 }
                 continue;

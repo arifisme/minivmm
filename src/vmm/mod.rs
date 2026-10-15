@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kvm_ioctls::{Cap, VmFd};
 use log::{error, info, warn};
@@ -169,7 +169,7 @@ impl Token {
 
 struct VcpuHandle {
     thread: JoinHandle<()>,
-    requests: Sender<VcpuRequest>,
+    requests: Sender<(u64, VcpuRequest)>,
 }
 
 pub struct Vmm {
@@ -185,7 +185,8 @@ pub struct Vmm {
     block: Option<Shared<VirtioPciDevice<Block>>>,
     net: Option<Shared<VirtioPciDevice<Net>>>,
     vcpus: Vec<VcpuHandle>,
-    responses: Receiver<(u8, VcpuResponse)>,
+    responses: Receiver<(u8, u64, VcpuResponse)>,
+    request_sequence: u64,
     paused: bool,
     signals: SignalFd,
     event_loop: EventLoop,
@@ -310,6 +311,7 @@ impl Vmm {
             net: machine.net,
             vcpus,
             responses,
+            request_sequence: 0,
             paused: false,
             signals,
             event_loop,
@@ -608,38 +610,25 @@ impl Vmm {
         Ok(())
     }
 
-    fn request_all(&self, request: impl Fn() -> VcpuRequest) -> Result<Vec<VcpuResponse>> {
-        while self.responses.try_recv().is_ok() {}
+    fn request_all(&mut self, request: impl Fn() -> VcpuRequest) -> Result<Vec<VcpuResponse>> {
+        self.request_sequence += 1;
         for vcpu in &self.vcpus {
-            let _ = vcpu.requests.send(request());
+            let _ = vcpu.requests.send((self.request_sequence, request()));
             let _ = vcpu.thread.kill(kick_signal());
         }
-        let mut responses: Vec<Option<VcpuResponse>> = self.vcpus.iter().map(|_| None).collect();
-        let missing = |responses: &[Option<VcpuResponse>]| {
-            let index = responses.iter().position(Option::is_none).unwrap_or(0);
-            VmmError::VcpuUnresponsive(index as u8)
-        };
-        for _ in 0..self.vcpus.len() {
-            let (index, response) = self
-                .responses
-                .recv_timeout(VCPU_RESPONSE_TIMEOUT)
-                .map_err(|_| missing(&responses))?;
-            if let VcpuResponse::Failed(message) = response {
-                return Err(VmmError::VcpuFailed { index, message });
-            }
-            if let Some(slot) = responses.get_mut(usize::from(index)) {
-                *slot = Some(response);
-            }
-        }
-        if responses.iter().any(Option::is_none) {
-            return Err(missing(&responses));
-        }
-        Ok(responses.into_iter().flatten().collect())
+        collect_responses(
+            &self.responses,
+            self.request_sequence,
+            self.vcpus.len(),
+            VCPU_RESPONSE_TIMEOUT,
+        )
     }
 
     fn shutdown(&mut self) {
         for vcpu in &self.vcpus {
-            let _ = vcpu.requests.send(VcpuRequest::Stop);
+            let _ = vcpu
+                .requests
+                .send((self.request_sequence, VcpuRequest::Stop));
             let _ = vcpu.thread.kill(kick_signal());
         }
         for vcpu in self.vcpus.drain(..) {
@@ -648,6 +637,32 @@ impl Vmm {
             }
         }
     }
+}
+
+fn collect_responses(
+    responses: &Receiver<(u8, u64, VcpuResponse)>,
+    sequence: u64,
+    count: usize,
+    timeout: Duration,
+) -> Result<Vec<VcpuResponse>> {
+    let deadline = Instant::now() + timeout;
+    let mut collected: Vec<Option<VcpuResponse>> = (0..count).map(|_| None).collect();
+    while let Some(missing) = collected.iter().position(Option::is_none) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let (index, answered, response) = responses
+            .recv_timeout(remaining)
+            .map_err(|_| VmmError::VcpuUnresponsive(missing as u8))?;
+        if answered != sequence {
+            continue;
+        }
+        if let VcpuResponse::Failed(message) = response {
+            return Err(VmmError::VcpuFailed { index, message });
+        }
+        if let Some(slot) = collected.get_mut(usize::from(index)) {
+            *slot = Some(response);
+        }
+    }
+    Ok(collected.into_iter().flatten().collect())
 }
 
 fn register_queues<D: VirtioDevice>(
@@ -684,7 +699,7 @@ fn restore_virtio<D: VirtioDevice<State = ()>>(
 
 fn spawn_vcpu(
     vcpu: Vcpu,
-    responses: Sender<(u8, VcpuResponse)>,
+    responses: Sender<(u8, u64, VcpuResponse)>,
     filter: Option<Arc<BpfProgram>>,
     exit: Arc<ExitSignal>,
 ) -> Result<VcpuHandle> {
@@ -726,5 +741,31 @@ mod tests {
         }
         assert_eq!(Token::decode(99), None);
         assert_eq!(Token::decode(u64::MAX), None);
+    }
+
+    #[test]
+    fn late_responses_to_earlier_requests_are_ignored() {
+        let (tx, rx) = mpsc::channel();
+        tx.send((0, 6, VcpuResponse::Paused)).unwrap();
+        tx.send((1, 7, VcpuResponse::Resumed)).unwrap();
+        tx.send((0, 7, VcpuResponse::Resumed)).unwrap();
+        let responses = collect_responses(&rx, 7, 2, Duration::from_millis(100)).unwrap();
+        assert!(responses.iter().all(|r| matches!(r, VcpuResponse::Resumed)));
+
+        tx.send((0, 8, VcpuResponse::Paused)).unwrap();
+        tx.send((1, 7, VcpuResponse::Paused)).unwrap();
+        assert!(matches!(
+            collect_responses(&rx, 8, 2, Duration::from_millis(100)),
+            Err(VmmError::VcpuUnresponsive(1))
+        ));
+
+        tx.send((1, 6, VcpuResponse::Failed("stale".into())))
+            .unwrap();
+        tx.send((0, 9, VcpuResponse::Paused)).unwrap();
+        tx.send((1, 9, VcpuResponse::Failed("now".into()))).unwrap();
+        assert!(matches!(
+            collect_responses(&rx, 9, 2, Duration::from_millis(100)),
+            Err(VmmError::VcpuFailed { index: 1, message }) if message == "now"
+        ));
     }
 }
