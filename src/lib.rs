@@ -8,6 +8,7 @@ pub mod json;
 pub mod kvm;
 pub mod logger;
 pub mod memory;
+pub mod seccomp;
 pub mod snapshot;
 pub mod sync;
 pub mod sys;

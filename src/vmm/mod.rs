@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use kvm_ioctls::{Cap, VmFd};
 use log::{error, info, warn};
+use seccompiler::BpfProgram;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vmm_sys_util::signal::Killable;
@@ -30,6 +31,9 @@ use crate::kvm::irq::GsiRouter;
 use crate::kvm::vcpu::{BootSetup, Vcpu, VcpuRequest, VcpuResponse, VcpuState};
 use crate::kvm::vm::{restore_vm_state, save_vm_state};
 use crate::memory::{GuestMemory, MemoryError};
+use crate::seccomp::{
+    SeccompError, ThreadKind, apply as apply_filter, build_filter, install_violation_reporter,
+};
 use crate::snapshot::{SnapshotError, SnapshotReader, VmSnapshot, write_snapshot};
 use crate::sync::LockExt;
 use crate::sys::signal::{SignalFd, block_signals, kick_signal, register_kick_handler};
@@ -65,6 +69,8 @@ pub enum VmmError {
     VcpuFailed { index: u8, message: String },
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+    #[error(transparent)]
+    Seccomp(#[from] SeccompError),
 }
 
 pub type Result<T> = std::result::Result<T, VmmError>;
@@ -99,6 +105,7 @@ pub struct BootConfig {
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeOptions {
     pub api_socket: Option<PathBuf>,
+    pub seccomp: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +187,7 @@ pub struct Vmm {
     stdin_registered: bool,
     stdin_open: bool,
     tap_registered: bool,
+    vmm_filter: Option<BpfProgram>,
 }
 
 fn prepare_process() -> Result<()> {
@@ -258,10 +266,19 @@ impl Vmm {
             None => None,
         };
 
+        let (vmm_filter, vcpu_filter) = if options.seccomp {
+            install_violation_reporter()?;
+            (
+                Some(build_filter(ThreadKind::Vmm)?),
+                Some(Arc::new(build_filter(ThreadKind::Vcpu)?)),
+            )
+        } else {
+            (None, None)
+        };
         let (response_tx, responses) = mpsc::channel();
         let mut vcpus = Vec::new();
         for vcpu in machine.vcpus {
-            vcpus.push(spawn_vcpu(vcpu, response_tx.clone())?);
+            vcpus.push(spawn_vcpu(vcpu, response_tx.clone(), vcpu_filter.clone())?);
         }
         Ok(Self {
             config,
@@ -281,6 +298,7 @@ impl Vmm {
             stdin_registered: true,
             stdin_open: true,
             tap_registered: false,
+            vmm_filter,
         })
     }
 
@@ -304,6 +322,9 @@ impl Vmm {
         } else {
             None
         };
+        if let Some(filter) = self.vmm_filter.take() {
+            apply_filter(&filter)?;
+        }
         let result = self.event_loop_body();
         self.shutdown();
         result
@@ -634,11 +655,23 @@ fn restore_virtio<D: VirtioDevice<State = ()>>(
     }
 }
 
-fn spawn_vcpu(vcpu: Vcpu, responses: Sender<(u8, VcpuResponse)>) -> Result<VcpuHandle> {
+fn spawn_vcpu(
+    vcpu: Vcpu,
+    responses: Sender<(u8, VcpuResponse)>,
+    filter: Option<Arc<BpfProgram>>,
+) -> Result<VcpuHandle> {
     let (requests, receiver) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name(format!("vcpu{}", vcpu.index()))
-        .spawn(move || vcpu.run(receiver, responses, false))?;
+        .spawn(move || {
+            if let Some(filter) = filter
+                && let Err(err) = apply_filter(&filter)
+            {
+                error!("vcpu {}: {err}", vcpu.index());
+                return;
+            }
+            vcpu.run(receiver, responses);
+        })?;
     Ok(VcpuHandle { thread, requests })
 }
 

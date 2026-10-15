@@ -300,15 +300,10 @@ impl Vcpu {
         KickTarget::new(self.fd.get_kvm_run())
     }
 
-    pub fn run(
-        mut self,
-        requests: Receiver<VcpuRequest>,
-        responses: Sender<(u8, VcpuResponse)>,
-        start_paused: bool,
-    ) {
+    pub fn run(mut self, requests: Receiver<VcpuRequest>, responses: Sender<(u8, VcpuResponse)>) {
         let kick_target = self.kick_target();
         kick_target.install();
-        let mut paused = start_paused;
+        let mut paused = false;
         loop {
             let request = if paused {
                 match requests.recv() {

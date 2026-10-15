@@ -38,6 +38,8 @@ struct Cli {
     api: Option<PathBuf>,
     #[arg(long, value_name = "SNAPSHOT", conflicts_with = "kernel")]
     restore: Option<PathBuf>,
+    #[arg(long)]
+    no_seccomp: bool,
     #[arg(long, default_value = "warn")]
     log_level: LevelFilter,
 }
@@ -69,6 +71,7 @@ fn parse_size(text: &str) -> Result<u64> {
 fn run(cli: Cli) -> Result<ExitReason> {
     let options = RuntimeOptions {
         api_socket: cli.api,
+        seccomp: !cli.no_seccomp,
     };
     let vmm = match (cli.restore, cli.kernel) {
         (Some(snapshot), _) => Vmm::restore(&snapshot, &options)
