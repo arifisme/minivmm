@@ -1,6 +1,15 @@
 use std::io;
 use std::os::fd::RawFd;
 
+pub fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: buf is valid for writes of buf.len() bytes.
+    let ret = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ret as usize)
+}
+
 pub fn is_terminal(fd: RawFd) -> bool {
     // SAFETY: isatty only inspects the descriptor.
     unsafe { libc::isatty(fd) == 1 }

@@ -55,7 +55,7 @@ jobs:
           cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --release -- --nocapture --test-threads=1
+        run: cargo test --release --no-fail-fast -- --nocapture --test-threads=1
 
       - name: Show guest logs
         if: always()

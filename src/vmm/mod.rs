@@ -1,6 +1,6 @@
 mod builder;
 
-use std::io::{self, Read};
+use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,7 +37,7 @@ use crate::seccomp::{
 use crate::snapshot::{SnapshotError, SnapshotReader, VmSnapshot, write_snapshot};
 use crate::sync::LockExt;
 use crate::sys::signal::{SignalFd, block_signals, kick_signal, register_kick_handler};
-use crate::sys::terminal::{RawModeGuard, is_terminal};
+use crate::sys::terminal::{RawModeGuard, is_terminal, read_fd};
 use builder::{Machine, Shared, build_machine, load_guest};
 
 const VCPU_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -428,7 +428,7 @@ impl Vmm {
             return self.pause_stdin();
         }
         let mut buf = vec![0u8; room];
-        match io::stdin().lock().read(&mut buf) {
+        match read_fd(io::stdin().as_raw_fd(), &mut buf) {
             Ok(0) => {
                 self.stdin_open = false;
                 self.pause_stdin()?;
