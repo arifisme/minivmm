@@ -1,0 +1,11 @@
+/target
+/guest/out/
+*.ext4
+*.cpio
+*.cpio.gz
+bzImage
+vmlinux
+*.snap
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/target/
