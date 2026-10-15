@@ -581,9 +581,10 @@ impl Vmm {
         let vcpus = self
             .request_all(|| VcpuRequest::SaveState)?
             .into_iter()
-            .map(|response| match response {
+            .enumerate()
+            .map(|(index, response)| match response {
                 VcpuResponse::State(state) => Ok(*state),
-                _ => Err(VmmError::VcpuUnresponsive(0)),
+                _ => Err(VmmError::VcpuUnresponsive(index as u8)),
             })
             .collect::<Result<Vec<VcpuState>>>()?;
         let snapshot = VmSnapshot {
@@ -603,16 +604,21 @@ impl Vmm {
     }
 
     fn request_all(&self, request: impl Fn() -> VcpuRequest) -> Result<Vec<VcpuResponse>> {
+        while self.responses.try_recv().is_ok() {}
         for vcpu in &self.vcpus {
             let _ = vcpu.requests.send(request());
             let _ = vcpu.thread.kill(kick_signal());
         }
         let mut responses: Vec<Option<VcpuResponse>> = self.vcpus.iter().map(|_| None).collect();
+        let missing = |responses: &[Option<VcpuResponse>]| {
+            let index = responses.iter().position(Option::is_none).unwrap_or(0);
+            VmmError::VcpuUnresponsive(index as u8)
+        };
         for _ in 0..self.vcpus.len() {
             let (index, response) = self
                 .responses
                 .recv_timeout(VCPU_RESPONSE_TIMEOUT)
-                .map_err(|_| VmmError::VcpuUnresponsive(0))?;
+                .map_err(|_| missing(&responses))?;
             if let VcpuResponse::Failed(message) = response {
                 return Err(VmmError::VcpuFailed { index, message });
             }
@@ -620,11 +626,10 @@ impl Vmm {
                 *slot = Some(response);
             }
         }
-        responses
-            .into_iter()
-            .enumerate()
-            .map(|(i, r)| r.ok_or(VmmError::VcpuUnresponsive(i as u8)))
-            .collect()
+        if responses.iter().any(Option::is_none) {
+            return Err(missing(&responses));
+        }
+        Ok(responses.into_iter().flatten().collect())
     }
 
     fn shutdown(&mut self) {
