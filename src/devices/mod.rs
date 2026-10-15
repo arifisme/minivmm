@@ -1,6 +1,7 @@
 pub mod acpi_pm;
 pub mod bus;
 pub mod i8042;
+pub mod pci;
 pub mod serial;
 
 use log::warn;
