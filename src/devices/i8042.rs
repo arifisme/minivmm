@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use log::info;
 use serde::{Deserialize, Serialize};
 
 use super::bus::BusDevice;
@@ -60,6 +61,11 @@ impl I8042 {
         status
     }
 
+    fn reset(&self) {
+        info!("guest reset the machine through the i8042");
+        self.exit.request(ExitReason::Reboot);
+    }
+
     fn command(&mut self, command: u8) {
         self.state.last_was_command = true;
         match command {
@@ -68,7 +74,7 @@ impl I8042 {
                 self.state.pending_command = Some(command)
             }
             CMD_SELF_TEST => self.state.output = Some(SELF_TEST_PASSED),
-            CMD_PULSE_RESET => self.exit.request(ExitReason::Reboot),
+            CMD_PULSE_RESET => self.reset(),
             _ => {}
         }
     }
@@ -77,9 +83,7 @@ impl I8042 {
         self.state.last_was_command = false;
         match self.state.pending_command.take() {
             Some(CMD_WRITE_COMMAND_BYTE) => self.state.command_byte = value,
-            Some(CMD_WRITE_OUTPUT_PORT) if value & OUTPUT_PORT_RESET_RELEASED == 0 => {
-                self.exit.request(ExitReason::Reboot)
-            }
+            Some(CMD_WRITE_OUTPUT_PORT) if value & OUTPUT_PORT_RESET_RELEASED == 0 => self.reset(),
             _ => {}
         }
     }

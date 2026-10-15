@@ -45,7 +45,13 @@ fn guest_reboot_stops_the_vmm() {
     vm.send("reboot -f\n");
     let status = vm.wait_exit(BOOT_TIMEOUT);
     assert!(status.success(), "exit status {status}");
-    assert!(vm.output().contains("Reboot"));
+    let output = vm.output();
+    assert!(output.contains("Reboot"));
+    assert!(
+        output.contains("reset the machine through the i8042"),
+        "the guest did not reset through the keyboard controller"
+    );
+    assert!(!output.contains("triple fault"));
 }
 
 #[test]
