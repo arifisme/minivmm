@@ -55,7 +55,9 @@ jobs:
           cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --release --no-fail-fast -- --nocapture --test-threads=1
+        run: |
+          set -o pipefail
+          cargo test --release --no-fail-fast -- --nocapture --test-threads=1 2>&1 | tee target/test-output.log
 
       - name: Show guest logs
         if: always()
@@ -65,6 +67,10 @@ jobs:
             cat "$log"
             echo "::endgroup::"
           done
+
+      - name: Test summary
+        if: always()
+        run: grep -aE '^test .* \.\.\. |panicked at|^test result|^failures:|^    [a-z_]+$' target/test-output.log || true
 
       - name: Upload logs
         if: always()

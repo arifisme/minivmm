@@ -57,7 +57,7 @@ fn guest_network_reaches_host_both_ways() {
     let listener = TcpListener::bind(format!("{HOST_IP}:0")).unwrap();
     let port = listener.local_addr().unwrap().port();
     vm.send(&format!(
-        "dd if=/dev/zero bs=1k count=300 2>/dev/null | nc {HOST_IP} {port}\n"
+        "dd if=/dev/zero bs=1k count=300 2>/dev/null | nc {HOST_IP} {port} &\n"
     ));
     let (mut from_guest, _) = listener.accept().unwrap();
     from_guest
@@ -66,6 +66,8 @@ fn guest_network_reaches_host_both_ways() {
     let mut received = Vec::new();
     from_guest.read_to_end(&mut received).unwrap();
     assert_eq!(received.len(), 300 * 1024);
+    drop(from_guest);
+    vm.run("wait");
 
     vm.send("poweroff\n");
     assert!(vm.wait_exit(BOOT_TIMEOUT).success());

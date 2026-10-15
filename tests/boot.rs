@@ -23,9 +23,9 @@ fn boots_initramfs_with_all_cpus_and_powers_off() {
     vm.wait_for("minivmm initramfs ready", BOOT_TIMEOUT);
     let out = vm.run("grep -c ^processor /proc/cpuinfo");
     assert!(out.contains("\n4"), "expected 4 CPUs: {out}");
-    let apic_ids = vm.run("grep 'apicid' /proc/cpuinfo | sort -u | wc -l");
+    let apic_ids = vm.run(r"grep '^apicid' /proc/cpuinfo | tr -d ' \t' | tr '\n' ' '");
     assert!(
-        apic_ids.contains("\n8"),
+        apic_ids.contains("apicid:0 apicid:1 apicid:2 apicid:3 "),
         "expected distinct APIC IDs: {apic_ids}"
     );
     vm.run("cat /proc/interrupts | grep -i ttyS0");
