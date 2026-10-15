@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Builds guest/out/{bzImage,initramfs.cpio.gz,rootfs.ext4}.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

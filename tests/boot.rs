@@ -79,3 +79,74 @@ fn guest_enumerates_pci_devices() {
     vm.send("poweroff\n");
     assert!(vm.wait_exit(BOOT_TIMEOUT).success());
 }
+
+#[test]
+fn memory_above_the_mmio_gap_is_usable() {
+    if !environment_ready("large_memory", &["bzImage", "initramfs.cpio.gz"]) {
+        return;
+    }
+    let mut args = initramfs_args(2);
+    let mem = args.iter().position(|a| a == "--mem").unwrap() + 1;
+    args[mem] = "4G".into();
+    let mut vm = Vm::start("large_memory", &args);
+    vm.wait_for(
+        "BIOS-e820: [mem 0x0000000100000000-0x000000013fffffff] usable",
+        BOOT_TIMEOUT,
+    );
+    vm.wait_for("minivmm initramfs ready", BOOT_TIMEOUT);
+    let total = vm.run("awk '/MemTotal/ { print int($2 / 1024) }' /proc/meminfo");
+    let mib: u64 = total
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .next()
+        .unwrap_or(0);
+    assert!(mib > 3800, "guest sees only {mib} MiB: {total}");
+    vm.send("poweroff -f\n");
+    assert!(vm.wait_exit(BOOT_TIMEOUT).success());
+}
+
+#[test]
+fn console_uses_raw_mode_and_restores_the_terminal() {
+    if !environment_ready("raw_terminal", &["bzImage", "initramfs.cpio.gz"]) {
+        return;
+    }
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty fills in two valid descriptors on success.
+    let ret = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(ret, 0, "openpty failed");
+    let canonical = |fd| {
+        // SAFETY: termios is plain data filled in by tcgetattr on a valid tty.
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: fd is an open terminal descriptor.
+        assert_eq!(unsafe { libc::tcgetattr(fd, &mut termios) }, 0);
+        termios.c_lflag & libc::ICANON != 0
+    };
+    assert!(canonical(slave));
+    let mut vm = Vm::start_with_stdin("raw_terminal", &initramfs_args(1), slave);
+    vm.wait_for("minivmm initramfs ready", BOOT_TIMEOUT);
+    assert!(
+        !canonical(slave),
+        "stdin should be in raw mode while the guest runs"
+    );
+    let command = b"poweroff -f\n";
+    assert_eq!(
+        // SAFETY: writing a command into the pty master that feeds the VMM's stdin.
+        unsafe { libc::write(master, command.as_ptr().cast(), command.len()) },
+        command.len() as isize
+    );
+    assert!(vm.wait_exit(BOOT_TIMEOUT).success());
+    assert!(canonical(slave), "terminal settings were not restored");
+    // SAFETY: closing the descriptors opened above.
+    unsafe {
+        libc::close(master);
+        libc::close(slave);
+    }
+}

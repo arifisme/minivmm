@@ -2,6 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -159,9 +160,21 @@ fn pump<R: Read + Send + 'static>(source: R, output: Arc<Mutex<String>>, mut log
 
 impl Vm {
     pub fn start(name: &str, args: &[String]) -> Self {
+        Self::spawn(name, args, Stdio::piped())
+    }
+
+    pub fn start_with_stdin(name: &str, args: &[String], tty: std::os::fd::RawFd) -> Self {
+        // SAFETY: duplicating a descriptor owned by the caller for the child's stdin.
+        let fd = unsafe { libc::dup(tty) };
+        assert!(fd >= 0, "dup failed");
+        // SAFETY: fd is a fresh duplicate owned by the returned Stdio.
+        Self::spawn(name, args, unsafe { Stdio::from_raw_fd(fd) })
+    }
+
+    fn spawn(name: &str, args: &[String], stdin: Stdio) -> Self {
         let mut child = Command::new(binary())
             .args(args)
-            .stdin(Stdio::piped())
+            .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
