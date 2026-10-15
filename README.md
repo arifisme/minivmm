@@ -188,7 +188,7 @@ vCPU, GSI routing), `src/devices` (bus, UART, i8042, ACPI PM, PCI, virtio),
 cargo test                                   # unit and integration tests
 MINIVMM_GUEST_DIR=guest/out MINIVMM_TAP=tap0 cargo test --release -- --test-threads=1
 cargo +nightly fuzz run virtqueue            # also: virtio_devices, device_registers,
-                                             #       api_json, bzimage
+                                             #       api_json, bzimage, snapshot_state
 ```
 
 Unit tests cover the boot structures and table builders, every device model, the

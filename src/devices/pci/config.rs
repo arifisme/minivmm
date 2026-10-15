@@ -43,7 +43,7 @@ struct Bar {
     address: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PciConfigState {
     registers: Vec<u32>,
     bars: Vec<(u32, u32)>,

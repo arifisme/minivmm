@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 minivmm = { path = ".." }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 vmm-sys-util = "0.15"
 
 [workspace]
@@ -46,6 +47,13 @@ bench = false
 [[bin]]
 name = "bzimage"
 path = "fuzz_targets/bzimage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_state"
+path = "fuzz_targets/snapshot_state.rs"
 test = false
 doc = false
 bench = false

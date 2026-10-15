@@ -21,7 +21,7 @@ use crate::exit::{ExitReason, ExitSignal};
 use crate::memory::{GuestAddress, GuestMemory};
 use crate::sys::signal::KickTarget;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct VcpuState {
     cpuid: Vec<kvm_cpuid_entry2>,
     regs: kvm_regs,

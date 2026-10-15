@@ -17,7 +17,7 @@ const SLEEP_ENABLE: u16 = 1 << 13;
 const SLEEP_TYPE_SHIFT: u16 = 10;
 const SLEEP_TYPE_MASK: u16 = 0x7;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcpiPmState {
     status: u16,
     enable: u16,

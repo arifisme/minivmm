@@ -52,7 +52,7 @@ impl PciDevice for PciHostBridge {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PciRootState {
     address: u32,
     host_bridge: PciConfigState,

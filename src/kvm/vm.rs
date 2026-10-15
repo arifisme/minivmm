@@ -11,7 +11,7 @@ use super::{IoctlContext, Result};
 use crate::arch::layout::{KVM_IDENTITY_MAP_START, KVM_TSS_START};
 use crate::memory::GuestMemory;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct VmState {
     pic_master: kvm_irqchip,
     pic_slave: kvm_irqchip,
