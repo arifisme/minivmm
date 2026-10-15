@@ -71,6 +71,59 @@ pub fn copy_rootfs(test: &str) -> PathBuf {
     path
 }
 
+pub const ROOTFS_CMDLINE: &str = "console=ttyS0 reboot=k panic=1 root=/dev/vda rw";
+pub const GUEST_IP: &str = "172.16.0.2";
+pub const HOST_IP: &str = "172.16.0.1";
+
+pub fn kernel_args(cmdline: &str, cpus: u8) -> Vec<String> {
+    vec![
+        "--kernel".into(),
+        artifact("bzImage").display().to_string(),
+        "--cmdline".into(),
+        cmdline.into(),
+        "--cpus".into(),
+        cpus.to_string(),
+        "--mem".into(),
+        "256M".into(),
+        "--log-level".into(),
+        "info".into(),
+    ]
+}
+
+pub fn rootfs_args(disk: &Path, cpus: u8) -> Vec<String> {
+    let mut args = kernel_args(ROOTFS_CMDLINE, cpus);
+    args.push("--disk".into());
+    args.push(disk.display().to_string());
+    args
+}
+
+pub fn api_request(socket: &Path, request: &str) -> String {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).expect("connect to API");
+    stream
+        .set_read_timeout(Some(COMMAND_TIMEOUT))
+        .expect("set API timeout");
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .expect("send API request");
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .expect("read API response");
+    line
+}
+
+pub fn wait_for_path(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} did not appear",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 pub fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_minivmm"))
 }

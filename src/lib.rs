@@ -1,3 +1,4 @@
+pub mod api;
 pub mod arch;
 pub mod boot;
 pub mod devices;
@@ -7,6 +8,7 @@ pub mod json;
 pub mod kvm;
 pub mod logger;
 pub mod memory;
+pub mod snapshot;
 pub mod sync;
 pub mod sys;
 pub mod vmm;
