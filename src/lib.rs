@@ -3,6 +3,7 @@ pub mod boot;
 pub mod devices;
 pub mod event_loop;
 pub mod exit;
+pub mod json;
 pub mod kvm;
 pub mod logger;
 pub mod memory;
