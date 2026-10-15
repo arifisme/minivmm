@@ -1,0 +1,51 @@
+[package]
+name = "minivmm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+minivmm = { path = ".." }
+vmm-sys-util = "0.15"
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "virtqueue"
+path = "fuzz_targets/virtqueue.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "virtio_devices"
+path = "fuzz_targets/virtio_devices.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "device_registers"
+path = "fuzz_targets/device_registers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_json"
+path = "fuzz_targets/api_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bzimage"
+path = "fuzz_targets/bzimage.rs"
+test = false
+doc = false
+bench = false
