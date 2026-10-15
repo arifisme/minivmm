@@ -77,7 +77,9 @@ impl Net {
         match self.backend.read_frame(&mut buf) {
             Ok(len) if len >= VNET_HEADER_LEN => {
                 buf.truncate(len);
-                // Version 1 headers always carry num_buffers; without mergeable buffers it is 1.
+                // No offloads are negotiated, so checksum and GSO fields must reach the guest
+                // as zero; version 1 headers always carry num_buffers, which is 1 here.
+                buf[..NUM_BUFFERS_OFFSET].fill(0);
                 buf[NUM_BUFFERS_OFFSET..VNET_HEADER_LEN].copy_from_slice(&1u16.to_le_bytes());
                 Some(buf)
             }
@@ -135,6 +137,8 @@ impl Net {
             let len = reader.remaining();
             if (VNET_HEADER_LEN as u64..=MAX_FRAME_LEN as u64).contains(&len) {
                 let n = reader.read(mem, &mut frame[..len as usize])?;
+                // The TAP would honour checksum and GSO requests the device never offered.
+                frame[..VNET_HEADER_LEN].fill(0);
                 if let Err(err) = self.backend.write_frame(&frame[..n]) {
                     debug!("dropping transmitted frame: {err}");
                 }
@@ -317,6 +321,50 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].len(), 62);
         assert_eq!(sent[0][12], 5);
+    }
+
+    #[test]
+    fn transmit_clears_unnegotiated_offload_fields() {
+        let (mut net, backend, mem, mut queues) = setup();
+        let mut header = [0u8; VNET_HEADER_LEN];
+        header[0] = 1;
+        header[1] = 1;
+        header[2..4].copy_from_slice(&54u16.to_le_bytes());
+        header[4..6].copy_from_slice(&1448u16.to_le_bytes());
+        header[6..8].copy_from_slice(&34u16.to_le_bytes());
+        header[8..10].copy_from_slice(&16u16.to_le_bytes());
+        mem.write(GuestAddress(DATA_AREA), &header).unwrap();
+        mem.write(GuestAddress(DATA_AREA + 12), &[5u8; 60]).unwrap();
+        let mut tx = queues.remove(TX_QUEUE);
+        tx.desc_table = GuestAddress(DESC_TABLE);
+        tx.avail_ring = GuestAddress(AVAIL_RING);
+        tx.used_ring = GuestAddress(USED_RING);
+        queues.push(tx);
+        chain(&mem, 0, &[(DATA_AREA, 72, false)]);
+        publish(&mem, 0, 0, 1);
+        net.process_queue(&mem, &mut queues, TX_QUEUE).unwrap();
+        let sent = backend.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(&sent[0][..NUM_BUFFERS_OFFSET], &[0; NUM_BUFFERS_OFFSET]);
+        assert_eq!(&sent[0][VNET_HEADER_LEN..], &[5u8; 60]);
+    }
+
+    #[test]
+    fn receive_clears_host_offload_flags() {
+        let (mut net, backend, mem, mut queues) = setup();
+        let mut frame = vec![0u8; 60];
+        frame[0] = 2;
+        frame[6..8].copy_from_slice(&34u16.to_le_bytes());
+        frame[VNET_HEADER_LEN..].fill(7);
+        backend.incoming.lock().unwrap().push_back(frame);
+        chain(&mem, 0, &[(DATA_AREA, 2048, true)]);
+        publish(&mem, 0, 0, 1);
+        net.receive(&mem, &mut queues).unwrap();
+        let mut received = [0xffu8; 60];
+        mem.read(GuestAddress(DATA_AREA), &mut received).unwrap();
+        assert_eq!(&received[..NUM_BUFFERS_OFFSET], &[0; NUM_BUFFERS_OFFSET]);
+        assert_eq!(&received[NUM_BUFFERS_OFFSET..VNET_HEADER_LEN], &[1, 0]);
+        assert!(received[VNET_HEADER_LEN..].iter().all(|b| *b == 7));
     }
 
     #[test]
