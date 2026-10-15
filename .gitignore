@@ -16,3 +16,4 @@ fuzz/target/
 # already existing elements were commented out
 
 #/target
+/guest/build/
