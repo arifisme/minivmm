@@ -5,6 +5,7 @@ const BYTE_PREFIX: u8 = 0x0a;
 const WORD_PREFIX: u8 = 0x0b;
 const DWORD_PREFIX: u8 = 0x0c;
 const QWORD_PREFIX: u8 = 0x0e;
+const BUFFER_OP: u8 = 0x11;
 const PACKAGE_OP: u8 = 0x12;
 const EXT_OP_PREFIX: u8 = 0x5b;
 const DEVICE_OP: u8 = 0x82;
@@ -96,6 +97,11 @@ pub fn package(elements: &[Vec<u8>]) -> Vec<u8> {
     [vec![PACKAGE_OP], pkg_length(body.len()), body].concat()
 }
 
+pub fn buffer(bytes: &[u8]) -> Vec<u8> {
+    let body = [integer(bytes.len() as u64), bytes.to_vec()].concat();
+    [vec![BUFFER_OP], pkg_length(body.len()), body].concat()
+}
+
 pub fn device(path: &str, children: &[Vec<u8>]) -> Vec<u8> {
     let mut body = name_string(path);
     for child in children {
@@ -151,6 +157,11 @@ mod tests {
                 0x08, b'_', b'S', b'5', b'_', 0x12, 0x08, 0x04, 0x0a, 0x05, 0x0a, 0x05, 0x00, 0x00
             ]
         );
+    }
+
+    #[test]
+    fn encodes_buffer() {
+        assert_eq!(buffer(&[0x79, 0]), [0x11, 0x04, 0x0a, 0x02, 0x79, 0x00]);
     }
 
     #[test]

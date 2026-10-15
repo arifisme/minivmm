@@ -1,7 +1,8 @@
 use super::aml;
 use super::layout::{
     ACPI_PM_CNT_LEN, ACPI_PM_EVT_LEN, ACPI_PM_PORT, ACPI_TABLES_END, ACPI_TABLES_START,
-    IOAPIC_ADDRESS, LAPIC_ADDRESS, SCI_IRQ,
+    IOAPIC_ADDRESS, LAPIC_ADDRESS, PCI_CONFIG_PORT, PCI_CONFIG_PORT_LEN, PCI_MMIO_END,
+    PCI_MMIO_START, SCI_IRQ,
 };
 use crate::memory::{GuestAddress, GuestMemory, MemoryError};
 
@@ -86,6 +87,59 @@ fn io_register(port: u16, bit_width: u8) -> [u8; 12] {
     gas
 }
 
+const WORD_ADDRESS_DESCRIPTOR: u8 = 0x88;
+const DWORD_ADDRESS_DESCRIPTOR: u8 = 0x87;
+const END_TAG: [u8; 2] = [0x79, 0x00];
+const RESOURCE_MEMORY: u8 = 0;
+const RESOURCE_IO: u8 = 1;
+const RESOURCE_BUS_NUMBER: u8 = 2;
+const PRODUCER_FIXED_RANGE: u8 = 0x0c;
+const IO_ENTIRE_RANGE: u8 = 0x03;
+const MEMORY_READ_WRITE: u8 = 0x01;
+
+fn word_address(resource: u8, type_flags: u8, min: u16, max: u16) -> Vec<u8> {
+    let mut descriptor = vec![
+        WORD_ADDRESS_DESCRIPTOR,
+        0x0d,
+        0x00,
+        resource,
+        PRODUCER_FIXED_RANGE,
+        type_flags,
+    ];
+    for field in [0, min, max, 0, max - min + 1] {
+        descriptor.extend_from_slice(&field.to_le_bytes());
+    }
+    descriptor
+}
+
+fn dword_memory(min: u32, max: u32) -> Vec<u8> {
+    let mut descriptor = vec![
+        DWORD_ADDRESS_DESCRIPTOR,
+        0x17,
+        0x00,
+        RESOURCE_MEMORY,
+        PRODUCER_FIXED_RANGE,
+        MEMORY_READ_WRITE,
+    ];
+    for field in [0, min, max, 0, max - min + 1] {
+        descriptor.extend_from_slice(&field.to_le_bytes());
+    }
+    descriptor
+}
+
+fn pci_host_bridge_resources() -> Vec<u8> {
+    let config_start = PCI_CONFIG_PORT as u16;
+    let config_end = config_start + PCI_CONFIG_PORT_LEN as u16;
+    [
+        word_address(RESOURCE_BUS_NUMBER, 0, 0, 0xff),
+        word_address(RESOURCE_IO, IO_ENTIRE_RANGE, 0, config_start - 1),
+        word_address(RESOURCE_IO, IO_ENTIRE_RANGE, config_end, 0xffff),
+        dword_memory(PCI_MMIO_START as u32, (PCI_MMIO_END - 1) as u32),
+        END_TAG.to_vec(),
+    ]
+    .concat()
+}
+
 fn dsdt() -> Vec<u8> {
     let mut sdt = Sdt::new(b"DSDT", 2);
     let sleep_type = aml::integer(SLEEP_TYPE_S5.into());
@@ -103,6 +157,7 @@ fn dsdt() -> Vec<u8> {
         &[
             aml::name("_HID", aml::eisa_id("PNP0A03")),
             aml::name("_UID", aml::integer(0)),
+            aml::name("_CRS", aml::buffer(&pci_host_bridge_resources())),
         ],
     ));
     sdt.finish()
@@ -234,6 +289,19 @@ mod tests {
     }
 
     #[test]
+    fn host_bridge_windows() {
+        let resources = pci_host_bridge_resources();
+        assert_eq!(resources.len(), 3 * 16 + 26 + 2);
+        let memory = &resources[48..74];
+        assert_eq!(u32_at(memory, 10), 0xc000_0000);
+        assert_eq!(u32_at(memory, 14), 0xfebf_ffff);
+        assert_eq!(u32_at(memory, 22), 0x3ec0_0000);
+        let io_low = &resources[16..32];
+        assert_eq!(u16::from_le_bytes([io_low[10], io_low[11]]), 0x0cf7);
+        assert_eq!(&resources[74..], &END_TAG);
+    }
+
+    #[test]
     fn tables_are_linked_and_checksummed() {
         let mem = GuestMemory::new(&[(GuestAddress(0), 0x100000)]).unwrap();
         let rsdp_addr = write_acpi_tables(&mem, 2).unwrap();
@@ -254,6 +322,7 @@ mod tests {
         let dsdt = read_table(&mem, u64_at(&fadt, 140));
         assert_eq!(&dsdt[..4], b"DSDT");
         assert!(dsdt.windows(4).any(|w| w == b"_S5_"));
+        assert!(dsdt.windows(4).any(|w| w == b"_CRS"));
         let facs_addr = u64_at(&fadt, 132);
         assert_eq!(facs_addr % 64, 0);
         let mut facs = [0u8; 4];
