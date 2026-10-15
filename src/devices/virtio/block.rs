@@ -389,6 +389,7 @@ mod tests {
     fn read_only_disk_refuses_writes() {
         let mut h = harness(true);
         assert_ne!(h.block.features() & VIRTIO_BLK_F_RO, 0);
+        h.mem.fill(GuestAddress(BUFFER), 512, 0xab).unwrap();
         assert_eq!(h.submit(REQUEST_OUT, 0, Some((512, false))).0, STATUS_IOERR);
         assert!(h.disk.0.lock().unwrap()[..512].iter().all(|b| *b == 0));
         assert_eq!(h.submit(REQUEST_IN, 1, Some((512, true))).0, STATUS_OK);
