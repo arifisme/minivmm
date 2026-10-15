@@ -22,10 +22,14 @@ build_kernel() {
     make -C "$src" -s olddefconfig
     local missing=0
     while IFS= read -r line; do
-        if ! grep -qx "$line" "$src/.config"; then
-            echo "kernel config option not applied: $line" >&2
-            missing=1
-        fi
+        case "$line" in
+            "# CONFIG_"*" is not set")
+                local symbol="${line#\# }"
+                symbol="${symbol% is not set}"
+                ! grep -q "^$symbol=" "$src/.config"
+                ;;
+            *) grep -qx "$line" "$src/.config" ;;
+        esac || { echo "kernel config option not applied: $line" >&2; missing=1; }
     done < "$ROOT/guest/kernel.config"
     [[ $missing -eq 0 ]]
     make -C "$src" -s -j"$JOBS" bzImage
