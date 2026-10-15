@@ -498,6 +498,13 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         if !queues_match {
             return Err(invalid("virtqueue layout mismatch"));
         }
+        if state
+            .queues
+            .iter()
+            .any(|queue| queue.ready && !queue.is_valid(&self.memory))
+        {
+            return Err(invalid("snapshot contains an invalid virtqueue"));
+        }
         if !self.config.restore(&state.pci) {
             return Err(invalid("PCI configuration mismatch"));
         }
@@ -981,6 +988,24 @@ pub(crate) mod tests {
         other.process_queue(0);
         assert_eq!(used_index(&mem), 2);
         assert_eq!(irqs[0].count(), 1);
+    }
+
+    #[test]
+    fn restore_rejects_invalid_queues() {
+        let (mut dev, _, mem) = echo();
+        let mut state = dev.state();
+        state.queues[0].ready = true;
+        state.queues[0].size = 0;
+        assert!(dev.restore(state).is_err());
+        let (mut other, _) = build(
+            Echo {
+                processed: Arc::new(Mutex::new(Vec::new())),
+            },
+            mem,
+        );
+        let mut state = other.state();
+        state.queues.pop();
+        assert!(other.restore(state).is_err());
     }
 
     #[test]

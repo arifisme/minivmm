@@ -79,6 +79,9 @@ impl Bus {
     }
 
     fn resolve(&self, addr: u64, len: usize) -> Option<(u64, Arc<Mutex<dyn BusDevice>>)> {
+        if len == 0 {
+            return None;
+        }
         let map = self.entries.read_or_recover();
         let (base, entry) = map.range(..=addr).next_back()?;
         let offset = addr - base;
@@ -139,6 +142,7 @@ mod tests {
         assert!(!bus.read(0x10f, &mut data));
         assert!(!bus.read(0xff, &mut [0u8; 1]));
         assert!(!bus.write(0x110, &[0]));
+        assert!(!bus.read(0x104, &mut []));
     }
 
     #[test]
