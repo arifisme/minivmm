@@ -19,6 +19,11 @@ fn ext4_root_persists_writes_across_reboot() {
     vm.run("dd if=/dev/urandom of=/root/blob bs=1k count=2048 2>/dev/null");
     let checksum = vm.run("md5sum /root/blob");
     vm.run("echo persisted-data > /root/marker && sync");
+    let cache = vm.run("cat /sys/block/vda/queue/write_cache");
+    assert!(
+        cache.contains("write back"),
+        "flush was not negotiated: {cache}"
+    );
     let serial = vm.run("cat /sys/block/vda/serial");
     assert!(serial.contains("minivmm-"), "{serial}");
     vm.send("reboot\n");
