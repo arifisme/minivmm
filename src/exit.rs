@@ -1,5 +1,5 @@
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use log::warn;
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
@@ -43,6 +43,22 @@ impl ExitSignal {
     }
 }
 
+pub struct ExitOnPanic(Arc<ExitSignal>);
+
+impl ExitOnPanic {
+    pub fn new(signal: Arc<ExitSignal>) -> Self {
+        Self(signal)
+    }
+}
+
+impl Drop for ExitOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.request(ExitReason::Fault);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,5 +71,22 @@ mod tests {
         signal.request(ExitReason::PowerOff);
         assert_eq!(signal.reason(), Some(ExitReason::Reboot));
         assert_eq!(signal.event().read().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_panicking_thread_requests_a_fault_exit() {
+        let signal = Arc::new(ExitSignal::new().unwrap());
+        let guard = ExitOnPanic::new(signal.clone());
+        let result = std::thread::spawn(move || {
+            let _guard = guard;
+            std::panic::resume_unwind(Box::new("vCPU loop failed"));
+        })
+        .join();
+        assert!(result.is_err());
+        assert_eq!(signal.reason(), Some(ExitReason::Fault));
+
+        let quiet = Arc::new(ExitSignal::new().unwrap());
+        drop(ExitOnPanic::new(quiet.clone()));
+        assert_eq!(quiet.reason(), None);
     }
 }

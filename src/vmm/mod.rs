@@ -27,7 +27,7 @@ use crate::devices::virtio::block::Block;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pci::{VirtioPciDevice, VirtioPciState};
 use crate::event_loop::EventLoop;
-use crate::exit::{ExitReason, ExitSignal};
+use crate::exit::{ExitOnPanic, ExitReason, ExitSignal};
 use crate::json::Json;
 use crate::kvm::KvmError;
 use crate::kvm::irq::GsiRouter;
@@ -289,7 +289,12 @@ impl Vmm {
         let (response_tx, responses) = mpsc::channel();
         let mut vcpus = Vec::new();
         for vcpu in machine.vcpus {
-            vcpus.push(spawn_vcpu(vcpu, response_tx.clone(), vcpu_filter.clone())?);
+            vcpus.push(spawn_vcpu(
+                vcpu,
+                response_tx.clone(),
+                vcpu_filter.clone(),
+                machine.exit.clone(),
+            )?);
         }
         Ok(Self {
             config,
@@ -681,15 +686,18 @@ fn spawn_vcpu(
     vcpu: Vcpu,
     responses: Sender<(u8, VcpuResponse)>,
     filter: Option<Arc<BpfProgram>>,
+    exit: Arc<ExitSignal>,
 ) -> Result<VcpuHandle> {
     let (requests, receiver) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name(format!("vcpu{}", vcpu.index()))
         .spawn(move || {
+            let _fault_on_panic = ExitOnPanic::new(exit.clone());
             if let Some(filter) = filter
                 && let Err(err) = apply_filter(&filter)
             {
                 error!("vcpu {}: {err}", vcpu.index());
+                exit.request(ExitReason::Fault);
                 return;
             }
             vcpu.run(receiver, responses);
