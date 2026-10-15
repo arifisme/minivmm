@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use super::bus::BusDevice;
 use super::read_register_bytes;
 use crate::arch::acpi::SLEEP_TYPE_S5;
@@ -14,6 +16,13 @@ const SCI_ENABLED: u16 = 1 << 0;
 const SLEEP_ENABLE: u16 = 1 << 13;
 const SLEEP_TYPE_SHIFT: u16 = 10;
 const SLEEP_TYPE_MASK: u16 = 0x7;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpiPmState {
+    status: u16,
+    enable: u16,
+    control: u16,
+}
 
 pub struct AcpiPm {
     exit: Arc<ExitSignal>,
@@ -31,6 +40,20 @@ impl AcpiPm {
             // The FADT has no SMI command port, so the OS expects ACPI mode to be on already.
             control: SCI_ENABLED,
         }
+    }
+
+    pub fn state(&self) -> AcpiPmState {
+        AcpiPmState {
+            status: self.status,
+            enable: self.enable,
+            control: self.control,
+        }
+    }
+
+    pub fn restore(&mut self, state: AcpiPmState) {
+        self.status = state.status;
+        self.enable = state.enable;
+        self.control = state.control | SCI_ENABLED;
     }
 
     fn registers(&self) -> [u8; REGISTER_FILE_LEN] {
@@ -120,6 +143,15 @@ mod tests {
         let mut control = [0u8; 2];
         pm.read(4, &mut control);
         assert_eq!(u16::from_le_bytes(control) & SCI_ENABLED, SCI_ENABLED);
+    }
+
+    #[test]
+    fn state_round_trip() {
+        let (mut pm, _) = device();
+        pm.write(2, &[0x21, 0x01]);
+        let (mut other, _) = device();
+        other.restore(pm.state());
+        assert_eq!(other.state(), pm.state());
     }
 
     #[test]

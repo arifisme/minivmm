@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use super::bus::BusDevice;
 use crate::exit::{ExitReason, ExitSignal};
 
@@ -18,51 +20,63 @@ const CMD_PULSE_RESET: u8 = 0xfe;
 const SELF_TEST_PASSED: u8 = 0x55;
 const OUTPUT_PORT_RESET_RELEASED: u8 = 0x01;
 
-pub struct I8042 {
-    exit: Arc<ExitSignal>,
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct I8042State {
     command_byte: u8,
     output: Option<u8>,
     pending_command: Option<u8>,
     last_was_command: bool,
 }
 
+pub struct I8042 {
+    exit: Arc<ExitSignal>,
+    state: I8042State,
+}
+
 impl I8042 {
     pub fn new(exit: Arc<ExitSignal>) -> Self {
         Self {
             exit,
-            command_byte: 0,
-            output: None,
-            pending_command: None,
-            last_was_command: false,
+            state: I8042State::default(),
         }
+    }
+
+    pub fn state(&self) -> I8042State {
+        self.state.clone()
+    }
+
+    pub fn restore(&mut self, state: I8042State) {
+        self.state = state;
     }
 
     fn status(&self) -> u8 {
         let mut status = STATUS_SYSTEM_FLAG;
-        if self.output.is_some() {
+        if self.state.output.is_some() {
             status |= STATUS_OUTPUT_FULL;
         }
-        if self.last_was_command {
+        if self.state.last_was_command {
             status |= STATUS_COMMAND;
         }
         status
     }
 
     fn command(&mut self, command: u8) {
-        self.last_was_command = true;
+        self.state.last_was_command = true;
         match command {
-            CMD_READ_COMMAND_BYTE => self.output = Some(self.command_byte),
-            CMD_WRITE_COMMAND_BYTE | CMD_WRITE_OUTPUT_PORT => self.pending_command = Some(command),
-            CMD_SELF_TEST => self.output = Some(SELF_TEST_PASSED),
+            CMD_READ_COMMAND_BYTE => self.state.output = Some(self.state.command_byte),
+            CMD_WRITE_COMMAND_BYTE | CMD_WRITE_OUTPUT_PORT => {
+                self.state.pending_command = Some(command)
+            }
+            CMD_SELF_TEST => self.state.output = Some(SELF_TEST_PASSED),
             CMD_PULSE_RESET => self.exit.request(ExitReason::Reboot),
             _ => {}
         }
     }
 
     fn data(&mut self, value: u8) {
-        self.last_was_command = false;
-        match self.pending_command.take() {
-            Some(CMD_WRITE_COMMAND_BYTE) => self.command_byte = value,
+        self.state.last_was_command = false;
+        match self.state.pending_command.take() {
+            Some(CMD_WRITE_COMMAND_BYTE) => self.state.command_byte = value,
             Some(CMD_WRITE_OUTPUT_PORT) if value & OUTPUT_PORT_RESET_RELEASED == 0 => {
                 self.exit.request(ExitReason::Reboot)
             }
@@ -74,7 +88,7 @@ impl I8042 {
 impl BusDevice for I8042 {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
         let value = match (offset, data.len()) {
-            (DATA_OFFSET, 1) => self.output.take().unwrap_or(0),
+            (DATA_OFFSET, 1) => self.state.output.take().unwrap_or(0),
             (COMMAND_OFFSET, 1) => self.status(),
             _ => 0xff,
         };
@@ -136,6 +150,20 @@ mod tests {
         assert_eq!(byte[0], SELF_TEST_PASSED);
         dev.read(DATA_OFFSET, &mut byte);
         assert_eq!(byte[0], 0);
+        assert_eq!(exit.reason(), None);
+    }
+
+    #[test]
+    fn state_round_trip() {
+        let (mut dev, _) = device();
+        dev.write(COMMAND_OFFSET, &[CMD_WRITE_COMMAND_BYTE]);
+        let (mut other, exit) = device();
+        other.restore(dev.state());
+        other.write(DATA_OFFSET, &[0x61]);
+        other.write(COMMAND_OFFSET, &[CMD_READ_COMMAND_BYTE]);
+        let mut byte = [0u8];
+        other.read(DATA_OFFSET, &mut byte);
+        assert_eq!(byte[0], 0x61);
         assert_eq!(exit.reason(), None);
     }
 

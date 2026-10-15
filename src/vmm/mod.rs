@@ -17,7 +17,10 @@ use vmm_sys_util::signal::Killable;
 
 use crate::api::{ApiCommand, ApiServer, error_response, parse_command};
 use crate::boot::bzimage::BootError;
+use crate::devices::acpi_pm::AcpiPm;
 use crate::devices::bus::{Bus, BusError};
+use crate::devices::i8042::I8042;
+use crate::devices::pci::root::PciConfigIo;
 use crate::devices::serial::Serial;
 use crate::devices::virtio::VirtioDevice;
 use crate::devices::virtio::block::Block;
@@ -176,6 +179,9 @@ pub struct Vmm {
     exit: Arc<ExitSignal>,
     router: Shared<GsiRouter>,
     serial: Shared<Serial>,
+    i8042: Shared<I8042>,
+    acpi_pm: Shared<AcpiPm>,
+    pci: Shared<PciConfigIo>,
     block: Option<Shared<VirtioPciDevice<Block>>>,
     net: Option<Shared<VirtioPciDevice<Net>>>,
     vcpus: Vec<VcpuHandle>,
@@ -235,6 +241,11 @@ impl Vmm {
         restore_vm_state(&machine.vm, &snapshot.vm)?;
         machine.router.lock_or_recover().restore(snapshot.routing)?;
         machine.serial.lock_or_recover().restore(snapshot.serial);
+        machine.i8042.lock_or_recover().restore(snapshot.i8042);
+        machine.acpi_pm.lock_or_recover().restore(snapshot.acpi_pm);
+        if !machine.pci.lock_or_recover().restore(&snapshot.pci) {
+            return Err(SnapshotError::Corrupt("PCI host bridge state mismatch".into()).into());
+        }
         restore_virtio(&machine.block, snapshot.block, &machine.mmio)?;
         restore_virtio(&machine.net, snapshot.net, &machine.mmio)?;
         for (vcpu, state) in machine.vcpus.iter().zip(&snapshot.vcpus) {
@@ -287,6 +298,9 @@ impl Vmm {
             exit: machine.exit,
             router: machine.router,
             serial: machine.serial,
+            i8042: machine.i8042,
+            acpi_pm: machine.acpi_pm,
+            pci: machine.pci,
             block: machine.block,
             net: machine.net,
             vcpus,
@@ -578,6 +592,9 @@ impl Vmm {
             routing: self.router.lock_or_recover().state(),
             vcpus,
             serial: self.serial.lock_or_recover().state(),
+            i8042: self.i8042.lock_or_recover().state(),
+            acpi_pm: self.acpi_pm.lock_or_recover().state(),
+            pci: self.pci.lock_or_recover().state(),
             block: self.block.as_ref().map(|d| d.lock_or_recover().state()),
             net: self.net.as_ref().map(|d| d.lock_or_recover().state()),
         };

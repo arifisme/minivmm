@@ -5,6 +5,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::devices::acpi_pm::AcpiPmState;
+use crate::devices::i8042::I8042State;
+use crate::devices::pci::root::PciRootState;
 use crate::devices::serial::SerialState;
 use crate::devices::virtio::pci::VirtioPciState;
 use crate::kvm::irq::RoutingState;
@@ -40,6 +43,9 @@ pub struct VmSnapshot {
     pub routing: RoutingState,
     pub vcpus: Vec<VcpuState>,
     pub serial: SerialState,
+    pub i8042: I8042State,
+    pub acpi_pm: AcpiPmState,
+    pub pci: PciRootState,
     pub block: Option<VirtioPciState<()>>,
     pub net: Option<VirtioPciState<()>>,
 }

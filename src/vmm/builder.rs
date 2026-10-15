@@ -65,6 +65,9 @@ pub struct Machine {
     pub mmio: Arc<Bus>,
     pub router: Shared<GsiRouter>,
     pub serial: Shared<Serial>,
+    pub i8042: Shared<I8042>,
+    pub acpi_pm: Shared<AcpiPm>,
+    pub pci: Shared<PciConfigIo>,
     pub block: Option<Shared<VirtioPciDevice<Block>>>,
     pub net: Option<Shared<VirtioPciDevice<Net>>>,
     pub vcpus: Vec<Vcpu>,
@@ -177,16 +180,10 @@ pub fn build_machine(config: &MachineConfig) -> Result<Machine> {
         Box::new(io::stdout()),
     )));
     pio.insert(serial.clone(), COM1_PORT, COM_PORT_LEN)?;
-    pio.insert(
-        Arc::new(Mutex::new(I8042::new(exit.clone()))),
-        I8042_PORT,
-        I8042_PORT_LEN,
-    )?;
-    pio.insert(
-        Arc::new(Mutex::new(AcpiPm::new(exit.clone()))),
-        u64::from(ACPI_PM_PORT),
-        ACPI_PM_LEN,
-    )?;
+    let i8042 = Arc::new(Mutex::new(I8042::new(exit.clone())));
+    pio.insert(i8042.clone(), I8042_PORT, I8042_PORT_LEN)?;
+    let acpi_pm = Arc::new(Mutex::new(AcpiPm::new(exit.clone())));
+    pio.insert(acpi_pm.clone(), u64::from(ACPI_PM_PORT), ACPI_PM_LEN)?;
 
     let mut pci = PciConfigIo::new(mmio.clone());
     let mut bars = BarAllocator {
@@ -221,11 +218,8 @@ pub fn build_machine(config: &MachineConfig) -> Result<Machine> {
         }
         None => None,
     };
-    pio.insert(
-        Arc::new(Mutex::new(pci)),
-        PCI_CONFIG_PORT,
-        PCI_CONFIG_PORT_LEN,
-    )?;
+    let pci = Arc::new(Mutex::new(pci));
+    pio.insert(pci.clone(), PCI_CONFIG_PORT, PCI_CONFIG_PORT_LEN)?;
     router.lock_or_recover().commit()?;
 
     let vcpus = (0..config.cpus)
@@ -240,6 +234,9 @@ pub fn build_machine(config: &MachineConfig) -> Result<Machine> {
         mmio,
         router,
         serial,
+        i8042,
+        acpi_pm,
+        pci,
         block,
         net,
         vcpus,

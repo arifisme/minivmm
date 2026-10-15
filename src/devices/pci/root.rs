@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use log::warn;
+use serde::{Deserialize, Serialize};
 
 use super::PciDevice;
-use super::config::{BarChange, PciConfiguration, PciIds};
+use super::config::{BarChange, PciConfigState, PciConfiguration, PciIds};
 use crate::devices::bus::{Bus, BusDevice};
 use crate::sync::LockExt;
 
@@ -51,8 +52,15 @@ impl PciDevice for PciHostBridge {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PciRootState {
+    address: u32,
+    host_bridge: PciConfigState,
+}
+
 pub struct PciConfigIo {
     address: u32,
+    host_bridge: Arc<Mutex<PciHostBridge>>,
     devices: Vec<Option<Arc<Mutex<dyn PciDevice>>>>,
     mmio: Arc<Bus>,
 }
@@ -64,13 +72,30 @@ struct ConfigAddress {
 
 impl PciConfigIo {
     pub fn new(mmio: Arc<Bus>) -> Self {
+        let host_bridge = Arc::new(Mutex::new(PciHostBridge::new()));
         let mut devices: Vec<Option<Arc<Mutex<dyn PciDevice>>>> = vec![None; MAX_DEVICES];
-        devices[0] = Some(Arc::new(Mutex::new(PciHostBridge::new())));
+        devices[0] = Some(host_bridge.clone());
         Self {
             address: 0,
+            host_bridge,
             devices,
             mmio,
         }
+    }
+
+    pub fn state(&self) -> PciRootState {
+        PciRootState {
+            address: self.address,
+            host_bridge: self.host_bridge.lock_or_recover().config.state(),
+        }
+    }
+
+    pub fn restore(&mut self, state: &PciRootState) -> bool {
+        self.address = state.address & ADDRESS_REGISTER_MASK;
+        self.host_bridge
+            .lock_or_recover()
+            .config
+            .restore(&state.host_bridge)
     }
 
     pub fn add_device(&mut self, device: Arc<Mutex<dyn PciDevice>>) -> Option<usize> {
@@ -230,6 +255,17 @@ mod tests {
         let mut address = [0u8; 4];
         io.read(0, &mut address);
         assert_eq!(u32::from_le_bytes(address), ADDRESS_ENABLE | (1 << 11));
+    }
+
+    #[test]
+    fn state_round_trip() {
+        let (mut io, mmio) = setup();
+        select(&mut io, 0, 4);
+        io.write(4, &[0x06, 0, 0, 0]);
+        let state = io.state();
+        let mut other = PciConfigIo::new(mmio);
+        assert!(other.restore(&state));
+        assert_eq!(read_u32(&mut other) & 0xffff, 0x6);
     }
 
     #[test]

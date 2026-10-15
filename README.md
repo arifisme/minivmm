@@ -167,7 +167,8 @@ TAP device must still exist and the disk must not have been modified in between.
   encoded state blob, the blob, then each guest RAM region in address order. The state
   holds the machine configuration, PIC/IOAPIC/PIT/kvmclock state, the GSI routing
   table, per-vCPU CPUID, registers, special registers, XSAVE, XCRs, MSRs, LAPIC, MP
-  state and pending events, the UART state and, for each virtio device, PCI
+  state and pending events, the UART, i8042 and ACPI PM registers, the latched PCI
+  configuration address and host bridge config space, and, for each virtio device, PCI
   configuration space, MSI-X table, transport registers and virtqueue indices.
 - **Seccomp.** Before entering their loops, the main thread and each vCPU thread
   install their own BPF filter (built with seccompiler). `ioctl` is restricted to the
