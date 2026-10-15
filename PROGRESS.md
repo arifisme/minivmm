@@ -29,7 +29,8 @@
 ## Fuzzing
 Targets in `fuzz/`: `virtqueue`, `virtio_devices` (blk and net through the PCI transport),
 `device_registers` (UART, i8042, ACPI PM, PCI config space, virtio BAR), `api_json`,
-`bzimage`. Local runs, none of which found a crash:
+`bzimage`, `snapshot_state` (decoded snapshot state restored into the device models).
+Local runs, none of which found a crash:
 
 | Target | Time | Executions |
 |---|---|---|
@@ -38,6 +39,17 @@ Targets in `fuzz/`: `virtqueue`, `virtio_devices` (blk and net through the PCI t
 | device_registers | 5 min | 2.6 M |
 | api_json | 5 min | 28.0 M |
 | bzimage | 5 min | 14.8 M |
+
+After the fixes recorded in AUDIT.md, every target ran again for 5 minutes, with no crash:
+
+| Target | Time | Executions |
+|---|---|---|
+| virtqueue | 5 min | 15.3 M |
+| virtio_devices | 5 min | 2.7 M |
+| device_registers | 5 min | 2.7 M |
+| api_json | 5 min | 15.5 M |
+| bzimage | 5 min | 29.3 M |
+| snapshot_state | 5 min | 11.1 M |
 
 CI runs every target for 60 seconds on each push. Hardening found by review rather than
 fuzzing: empty bus accesses are ignored and restored virtqueues are revalidated.

@@ -34,6 +34,12 @@ KVM or the device models.
   RX: any forwarded packet with `CHECKSUM_UNNECESSARY` reaches the guest with
   `DATA_VALID` set.
 
+- **Resolution (fixed, `c237870`):** both directions now zero the ten offload bytes of
+  the header; received frames keep `num_buffers = 1`. New tests
+  `transmit_clears_unnegotiated_offload_fields` and `receive_clears_host_offload_flags`
+  failed before the change (the guest's GSO/checksum fields reached the backend and the
+  host's `DATA_VALID` reached the guest).
+
 ### 2. One API client can freeze the event loop (Medium)
 
 - **Location:** `src/api.rs`, `ApiServer::respond` and `ApiServer::read`.
@@ -46,6 +52,12 @@ KVM or the device models.
   without bound inside one call.
 - **Trigger:** a process with access to the API socket pipelines a few thousand
   `{"cmd":"status"}` lines without reading, or streams data with no newline.
+
+- **Resolution (fixed, `2f726dc`):** responses are written without blocking and a client
+  whose socket buffer is full is dropped; `read` stops draining once the buffer passes
+  `MAX_REQUEST_LEN`. Before the change `client_that_never_reads_cannot_block_the_server`
+  timed out with the server blocked in `respond`, and `one_read_buffers_a_bounded_amount`
+  saw 438 KB buffered by a single call.
 
 ### 3. Kernel footprint and initrd placement ignore the kernel's runtime address (Low)
 
@@ -60,6 +72,14 @@ KVM or the device models.
 - **Trigger:** the user boots with little memory or a large initrd, e.g. `--mem 64M` with
   a 40 MiB initrd: the initrd lands at 24 MiB, inside `[16 MiB, 16 MiB + init_size)`.
 
+- **Resolution (fixed, `77eb25b`):** the loader computes the runtime start exactly as the
+  boot protocol specifies and uses `max(payload end, runtime start + init_size)` as the
+  kernel's end for the fit check and initrd placement; a kernel that would run below
+  1 MiB is rejected. `footprint_starts_at_the_runtime_address`,
+  `rejects_kernel_whose_runtime_area_does_not_fit` and
+  `initrd_stays_clear_of_the_kernel_runtime_area` (the 64 MiB / 40 MiB case above) all
+  failed before the change.
+
 ### 4. seccomp kills the VMM after a stop/continue during a timed wait (Low)
 
 - **Location:** `src/seccomp.rs`, `COMMON_SYSCALLS`.
@@ -72,6 +92,10 @@ KVM or the device models.
   exits with "seccomp blocked syscall 219" and the guest is lost. Reproduced in a child
   process with the VMM filter installed.
 
+- **Resolution (fixed, `549b532`):** `restart_syscall` is allowed for both thread kinds.
+  `timed_waits_survive_a_stop_and_continue` stops and continues a filtered child blocked
+  in a timed futex wait; it exited with 159 ("blocked syscall 219") before the change.
+
 ### 5. seccomp allows executable mappings (Low)
 
 - **Location:** `src/seccomp.rs`, `COMMON_SYSCALLS`.
@@ -80,6 +104,11 @@ KVM or the device models.
   installed, so allowing `PROT_EXEC` only helps an attacker who already has a memory
   corruption primitive turn it into code execution.
 - **Trigger:** post-exploitation hardening; not reachable without another bug.
+
+- **Resolution (fixed, `976b712`):** `mmap` and `mprotect` are allowed only when
+  `PROT_EXEC` is clear. `executable_mappings_are_refused` failed before the change and
+  also checks that ordinary read/write mappings still work; the full KVM suite runs with
+  the new filters on CI.
 
 ### 6. A dying vCPU thread leaves a dangling kick pointer and goes unnoticed (Low)
 
@@ -95,6 +124,15 @@ KVM or the device models.
   times out.
 - **Trigger:** any panic on a vCPU thread, or a kernel that rejects the vCPU filter.
 
+- **Resolution (fixed, `2b0fd6d`, `588d7b3`):** `KickTarget` now detaches the handler in
+  `Drop`, and since it is a local of `Vcpu::run` it is dropped before the vCPU (and its
+  `kvm_run` mapping) even while unwinding. The vCPU thread holds an `ExitOnPanic` guard
+  that requests a `Fault` exit if the thread panics, and a failed filter install also
+  requests `Fault`, so the VMM stops instead of running on with a vCPU missing.
+  `unwinding_out_of_the_vcpu_loop_uninstalls_the_kick_target` failed before the change
+  (the kick wrote into the stale `kvm_run`); `a_panicking_thread_requests_a_fault_exit`
+  covers the guard.
+
 ### 7. Responses from a timed-out vCPU request can answer a later one (Low)
 
 - **Location:** `src/vmm/mod.rs`, `Vmm::request_all`.
@@ -107,6 +145,11 @@ KVM or the device models.
   console write while the host stops reading stdout), followed by another API request
   whose responses race with the late one.
 
+- **Resolution (fixed, `cd835b1`):** every request carries a sequence number that the
+  vCPU echoes; responses with another number are ignored and all vCPUs share one
+  deadline. `late_responses_to_earlier_requests_are_ignored` failed against the old
+  count-based matching (it returned the stale `Paused`).
+
 ### 8. Tests that cannot fail (Low)
 
 - **`devices::virtio::block::tests::read_only_disk_refuses_writes`**
@@ -118,6 +161,12 @@ KVM or the device models.
   Linux falls back to a triple fault when the keyboard-controller reset does nothing, so
   the test passes with a broken i8042 reset path.
 
+- **Resolution (fixed, `96e6d6c`, `156ce76`):** the block test now fills the buffer with
+  `0xab` first; a mutant that writes the data but still reports `IOERR` passed the old
+  test and fails the new one. The i8042 reset path logs "guest reset the machine through
+  the i8042", triple faults log a warning, and the reboot test requires the former and
+  rejects the latter.
+
 ### 9. Corrupted snapshots are neither tested nor fuzzed (Low)
 
 - **Location:** `src/snapshot.rs`, `fuzz/`.
@@ -128,7 +177,17 @@ KVM or the device models.
   device restores validate lengths and queue placement), so this is a coverage gap rather
   than a defect.
 
+- **Resolution (`6778ae7`):** `snapshot.rs` now has a round-trip test and tests that every
+  truncation of a snapshot file is an error, that bad magic, version, oversized state
+  length and trailing bytes are rejected, and that flipping any byte of the state blob
+  never panics. A new fuzz target, `snapshot_state`, decodes arbitrary `VmSnapshot` and
+  `VirtioPciState` blobs, restores them into the UART, i8042, ACPI PM, PCI root and a
+  virtio-blk device and then drives those devices. All passed without code changes,
+  confirming the review.
+
 ## Accepted
+
+These are real but deliberately left as they are, for the reason given with each.
 
 - **Guest memory is copied with plain (non-volatile) copies while vCPUs run.** Strictly a
   data race in Rust's memory model. Every guest structure (descriptor, ring index, request
@@ -157,3 +216,16 @@ KVM or the device models.
 - **The VMM thread's filter allows `openat`, `rename` and `unlink` on any path,** and
   accepts unlimited API connections. The snapshot command takes an arbitrary path, and
   the API is trusted (README: protected only by the socket's permissions).
+
+## Verification
+
+- Each fix landed in its own commit with the tests named above; `cargo fmt --check` and
+  `cargo clippy --all-targets -- -D warnings` are clean at every commit.
+- The CI workflow (KVM enabled on the runner, guest booted from the built kernel,
+  initramfs and ext4 root, `tap0` for networking, seccomp on) passed on the fixed code,
+  including the strengthened reboot test, which shows the guest now provably resets
+  through the i8042.
+- After the fixes every fuzz target, including the new `snapshot_state`, ran for 5
+  minutes locally without a crash: virtqueue 15.3 M executions, virtio_devices 2.7 M,
+  device_registers 2.7 M, api_json 15.5 M, bzimage 29.3 M, snapshot_state 11.1 M. CI
+  also fuzzes every target for 60 seconds on each push.
