@@ -4,17 +4,63 @@ on:
   push:
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: never
+
 jobs:
-  check:
+  test:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: Install toolchain and packages
+        run: |
+          rustup toolchain install stable --profile minimal -c clippy,rustfmt
+          rustup default stable
+          sudo apt-get update -q
+          sudo apt-get install -y -q flex bison bc libelf-dev libssl-dev e2fsprogs cpio
+
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
-          nproc
-          grep -o -m1 -E 'vmx|svm' /proc/cpuinfo
-          uname -a
-      - run: cargo build --release
+
+      - name: Cache guest artifacts
+        id: guest-cache
+        uses: actions/cache@v4
+        with:
+          path: guest/out
+          key: guest-${{ hashFiles('scripts/build-guest.sh', 'guest/kernel.config', 'guest/rcS', 'guest/inittab', 'guest/initramfs-init') }}
+
+      - name: Build guest artifacts
+        if: steps.guest-cache.outputs.cache-hit != 'true'
+        run: ./scripts/build-guest.sh
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Set up host networking
+        run: sudo ./scripts/setup-tap.sh tap0 "$USER"
+
+      - name: Format and lint
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --release -- --nocapture --test-threads=1
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-logs
+          path: target/tmp/guest-logs
+          if-no-files-found: ignore
