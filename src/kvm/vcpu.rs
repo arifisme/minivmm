@@ -302,6 +302,8 @@ impl Vcpu {
     }
 
     pub fn run(mut self, requests: Receiver<VcpuRequest>, responses: Sender<(u8, VcpuResponse)>) {
+        // Locals drop before `self`, so even when unwinding the kick handler is detached
+        // before the kvm_run mapping goes away.
         let kick_target = self.kick_target();
         kick_target.install();
         let mut paused = false;
@@ -347,6 +349,5 @@ impl Vcpu {
                 paused = true;
             }
         }
-        kick_target.uninstall();
     }
 }

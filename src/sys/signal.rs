@@ -19,7 +19,8 @@ extern "C" fn handle_kick(_: c_int, _: *mut siginfo_t, _: *mut c_void) {
     let run = KVM_RUN.with(Cell::get);
     if !run.is_null() {
         // SAFETY: the pointer refers to this thread's mapped kvm_run structure,
-        // installed by KickTarget::install and cleared before it is unmapped.
+        // installed by KickTarget::install and cleared when that KickTarget is dropped,
+        // which its owner guarantees happens before the structure is unmapped.
         unsafe { std::ptr::addr_of_mut!((*run).immediate_exit).write_volatile(1) };
     }
 }
@@ -38,8 +39,10 @@ impl KickTarget {
     pub fn install(&self) {
         KVM_RUN.with(|cell| cell.set(self.0));
     }
+}
 
-    pub fn uninstall(&self) {
+impl Drop for KickTarget {
+    fn drop(&mut self) {
         KVM_RUN.with(|cell| cell.set(null_mut()));
     }
 }
@@ -101,5 +104,32 @@ impl SignalFd {
 impl AsRawFd for SignalFd {
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+
+    use super::*;
+
+    #[test]
+    fn unwinding_out_of_the_vcpu_loop_uninstalls_the_kick_target() {
+        register_kick_handler().unwrap();
+        std::thread::spawn(|| {
+            let mut run = Box::new(kvm_run::default());
+            let target_run: *mut kvm_run = &mut *run;
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                // SAFETY: the box outlives this closure and nothing else accesses it meanwhile.
+                let target = KickTarget::new(unsafe { &mut *target_run });
+                target.install();
+                resume_unwind(Box::new("vCPU loop failed"));
+            }));
+            // SAFETY: sending the kick signal to the current thread.
+            unsafe { libc::pthread_kill(libc::pthread_self(), kick_signal()) };
+            assert_eq!(run.immediate_exit, 0, "kick reached a stale kvm_run");
+        })
+        .join()
+        .unwrap();
     }
 }
