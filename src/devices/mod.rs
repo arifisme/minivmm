@@ -3,6 +3,7 @@ pub mod bus;
 pub mod i8042;
 pub mod pci;
 pub mod serial;
+pub mod virtio;
 
 use log::warn;
 use vmm_sys_util::eventfd::EventFd;
