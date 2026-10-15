@@ -62,6 +62,8 @@ const COMMON_SYSCALLS: &[i64] = &[
     libc::SYS_mprotect,
     libc::SYS_brk,
     libc::SYS_rt_sigreturn,
+    // The kernel resumes a timed wait interrupted by a stop and continue through this call.
+    libc::SYS_restart_syscall,
     libc::SYS_rt_sigprocmask,
     libc::SYS_sigaltstack,
     libc::SYS_sched_yield,
@@ -260,5 +262,56 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), BLOCKED_SYSCALL_EXIT_CODE);
+    }
+
+    fn run_filtered_child(kind: ThreadKind, child: fn(), parent: impl Fn(libc::pid_t)) -> i32 {
+        let program = build_filter(kind).unwrap();
+        // SAFETY: the child only performs raw system calls before exiting.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            if install_violation_reporter().is_ok() && apply(&program).is_ok() {
+                child();
+            }
+            // SAFETY: exiting the forked child.
+            unsafe { libc::_exit(0) };
+        }
+        parent(pid);
+        let mut status = 0;
+        // SAFETY: waiting for the child created above.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status));
+        libc::WEXITSTATUS(status)
+    }
+
+    #[test]
+    fn timed_waits_survive_a_stop_and_continue() {
+        let wait = || {
+            let word = 0u32;
+            let timeout = libc::timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            };
+            // SAFETY: a private futex wait on a local word with a relative timeout.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    &word,
+                    libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+                    0,
+                    &timeout,
+                )
+            };
+        };
+        let stop_and_continue = |pid| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // SAFETY: signalling our own child.
+            unsafe { libc::kill(pid, libc::SIGSTOP) };
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // SAFETY: signalling our own child.
+            unsafe { libc::kill(pid, libc::SIGCONT) };
+        };
+        for kind in [ThreadKind::Vmm, ThreadKind::Vcpu] {
+            assert_eq!(run_filtered_child(kind, wait, stop_and_continue), 0);
+        }
     }
 }
