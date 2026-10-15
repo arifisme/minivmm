@@ -260,10 +260,6 @@ impl Queue {
         Ok(mem.read_obj(GuestAddress(self.avail_ring.raw() + RING_INDEX_OFFSET))?)
     }
 
-    pub fn has_available(&self, mem: &GuestMemory) -> Result<bool> {
-        Ok(self.ready && self.avail_index(mem)? != self.next_avail)
-    }
-
     pub fn pop(&mut self, mem: &GuestMemory) -> Result<Option<DescriptorChain>> {
         if !self.ready {
             return Ok(None);

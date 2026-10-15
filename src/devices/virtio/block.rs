@@ -116,20 +116,15 @@ impl Block {
         while done < len {
             let n = (len - done).min(IO_CHUNK as u64) as usize;
             let offset = sector * SECTOR_SIZE + done;
-            let copied = self
-                .disk
-                .read_at(&mut buf[..n], offset)
-                .map_err(QueueError::from_io)
-                .and_then(|()| writer.write(mem, &buf[..n]));
-            match copied {
-                Ok(count) if count == n => done += n as u64,
-                _ => {
-                    return Outcome::Data {
-                        status: STATUS_IOERR,
-                        written: done as u32,
-                    };
-                }
+            let copied = self.disk.read_at(&mut buf[..n], offset).is_ok()
+                && writer.write(mem, &buf[..n]).is_ok_and(|count| count == n);
+            if !copied {
+                return Outcome::Data {
+                    status: STATUS_IOERR,
+                    written: done as u32,
+                };
             }
+            done += n as u64;
         }
         Outcome::Data {
             status: STATUS_OK,
@@ -210,12 +205,6 @@ impl Block {
         status_writer.skip(data_room);
         status_writer.write(mem, &[status]).ok()?;
         Some(written + 1)
-    }
-}
-
-impl QueueError {
-    fn from_io(err: io::Error) -> Self {
-        QueueError::Memory(crate::memory::MemoryError::Io(err))
     }
 }
 

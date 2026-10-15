@@ -31,10 +31,6 @@ impl GuestAddress {
     pub fn checked_add(self, offset: u64) -> Option<Self> {
         self.0.checked_add(offset).map(Self)
     }
-
-    pub const fn offset_from(self, base: Self) -> u64 {
-        self.0 - base.0
-    }
 }
 
 /// # Safety

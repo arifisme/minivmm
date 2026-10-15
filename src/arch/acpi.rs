@@ -7,7 +7,6 @@ use super::layout::{
 use crate::memory::{GuestAddress, GuestMemory, MemoryError};
 
 pub const SLEEP_TYPE_S5: u8 = 5;
-pub const PM1_CNT_OFFSET: u64 = ACPI_PM_EVT_LEN as u64;
 
 const OEM_ID: &[u8; 6] = b"MINVMM";
 const OEM_TABLE_ID: &[u8; 8] = b"MINIVMM ";

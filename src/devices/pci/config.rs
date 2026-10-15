@@ -92,10 +92,6 @@ impl PciConfiguration {
         u64::from(self.bars[index].address)
     }
 
-    pub fn bar_size(&self, index: usize) -> u64 {
-        u64::from(self.bars[index].size)
-    }
-
     pub fn add_capability(&mut self, id: u8, body: &[u8], writable: &[u8]) -> usize {
         let offset = self.next_capability;
         let len = 2 + body.len();

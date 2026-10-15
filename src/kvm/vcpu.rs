@@ -296,7 +296,7 @@ impl Vcpu {
         self.fd.set_kvm_immediate_exit(0);
     }
 
-    pub fn kick_target(&mut self) -> KickTarget {
+    fn kick_target(&mut self) -> KickTarget {
         KickTarget::new(self.fd.get_kvm_run())
     }
 
