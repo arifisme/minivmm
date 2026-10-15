@@ -83,3 +83,23 @@ jobs:
           name: guest-logs
           path: target/tmp/guest-logs
           if-no-files-found: ignore
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install nightly toolchain and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+
+      - name: Fuzz each target briefly
+        working-directory: fuzz
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            echo "::group::$target"
+            cargo +nightly fuzz run "$target" -- -max_total_time=60 -rss_limit_mb=4096
+            echo "::endgroup::"
+          done

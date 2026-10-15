@@ -12,11 +12,16 @@ fuzz_target!(|data: &[u8]| {
     let mut input = Bytes::new(data);
     let mut queue = Queue::new(256);
     queue.size = 1 << (input.u8() % 9);
-    queue.desc_table = GuestAddress(u64::from(input.u16()) & !0xf);
-    queue.avail_ring = GuestAddress(u64::from(input.u16()) & !0x1);
-    queue.used_ring = GuestAddress(u64::from(input.u16()) & !0x3);
+    let desc = u64::from(input.u16());
+    let avail = u64::from(input.u16());
+    let used = u64::from(input.u16());
     let skip = input.u8();
-    let memory = memory_with(input.rest());
+    let seed = input.rest();
+    let span = (seed.len() as u64).max(64);
+    queue.desc_table = GuestAddress((desc % span) & !0xf);
+    queue.avail_ring = GuestAddress((avail % span) & !0x1);
+    queue.used_ring = GuestAddress(0x10000 + ((used % span) & !0x3));
+    let memory = memory_with(seed);
     if !queue.is_valid(&memory) {
         return;
     }
