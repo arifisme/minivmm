@@ -117,7 +117,12 @@ impl ApiServer {
                     closed = true;
                     break;
                 }
-                Ok(n) => client.buffer.extend_from_slice(&chunk[..n]),
+                Ok(n) => {
+                    client.buffer.extend_from_slice(&chunk[..n]);
+                    if client.buffer.len() > MAX_REQUEST_LEN {
+                        break;
+                    }
+                }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => {
@@ -141,11 +146,13 @@ impl ApiServer {
     }
 
     pub fn respond(&mut self, id: u32, response: &Json) {
-        if let Some(client) = self.clients.get_mut(&id) {
-            let line = format!("{response}\n");
-            let _ = client.stream.set_nonblocking(false);
-            let _ = client.stream.write_all(line.as_bytes());
-            let _ = client.stream.set_nonblocking(true);
+        let Some(client) = self.clients.get_mut(&id) else {
+            return;
+        };
+        let line = format!("{response}\n");
+        // Waiting for a client that does not read would stall the whole event loop.
+        if client.stream.write_all(line.as_bytes()).is_err() {
+            self.clients.remove(&id);
         }
     }
 
@@ -193,6 +200,49 @@ mod tests {
         assert!(parse_command(r#"{"cmd":"snapshot"}"#).is_err());
         assert!(parse_command(r#"{"cmd":"snapshot","path":""}"#).is_err());
         assert!(parse_command(r#"{"cmd":5}"#).is_err());
+    }
+
+    fn connected_server(dir: &vmm_sys_util::tempdir::TempDir) -> (ApiServer, UnixStream, u32) {
+        let path = dir.as_path().join("api.sock");
+        let mut server = ApiServer::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let id = server.accept()[0].0;
+        (server, client, id)
+    }
+
+    #[test]
+    fn client_that_never_reads_cannot_block_the_server() {
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let (mut server, _client, id) = connected_server(&dir);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let response = Json::object([("state", Json::from("x".repeat(100).as_str()))]);
+            for _ in 0..20_000 {
+                server.respond(id, &response);
+            }
+            let _ = done.send(server.client_fd(id).is_none());
+        });
+        let dropped = finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("respond blocked on a client that does not read");
+        assert!(dropped, "a client that stops reading should be dropped");
+    }
+
+    #[test]
+    fn one_read_buffers_a_bounded_amount() {
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let (mut server, mut client, id) = connected_server(&dir);
+        std::thread::spawn(move || {
+            let _ = client.write_all(&vec![b'x'; 4 << 20]);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let input = server.read(id);
+        assert!(input.closed);
+        let buffered = server.clients.get(&id).map_or(0, |c| c.buffer.len());
+        assert!(
+            buffered <= MAX_REQUEST_LEN + 4096,
+            "buffered {buffered} bytes"
+        );
     }
 
     #[test]
