@@ -56,6 +56,7 @@ fn get_irqchip(vm: &VmFd, chip_id: u32) -> Result<kvm_irqchip> {
     Ok(chip)
 }
 
+// KVM_GET_CLOCK reports flags such as TSC_STABLE that KVM_SET_CLOCK rejects.
 const KVM_CLOCK_SETTABLE_FLAGS: u32 = 0;
 
 pub fn save_vm_state(vm: &VmFd) -> Result<VmState> {

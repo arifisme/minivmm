@@ -28,6 +28,7 @@ impl AcpiPm {
             exit,
             status: 0,
             enable: 0,
+            // The FADT has no SMI command port, so the OS expects ACPI mode to be on already.
             control: SCI_ENABLED,
         }
     }

@@ -232,6 +232,7 @@ impl Vcpu {
                 RunOutcome::Continue
             }
             Ok(VcpuExit::Hlt) | Ok(VcpuExit::Intr) => RunOutcome::Continue,
+            // A triple fault resets an x86 machine.
             Ok(VcpuExit::Shutdown) => RunOutcome::Exit(ExitReason::Reboot),
             Ok(VcpuExit::SystemEvent(kind, _)) => match kind {
                 KVM_SYSTEM_EVENT_SHUTDOWN => RunOutcome::Exit(ExitReason::PowerOff),

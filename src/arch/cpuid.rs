@@ -9,6 +9,11 @@ const LEAF_AMD_FEATURES: u32 = 0x8000_0001;
 const LEAF_AMD_SIZE_IDENTIFIERS: u32 = 0x8000_0008;
 const LEAF_AMD_EXTENDED_APIC_ID: u32 = 0x8000_001e;
 
+const AMD_VENDOR: [u32; 3] = [
+    u32::from_le_bytes(*b"Auth"),
+    u32::from_le_bytes(*b"enti"),
+    u32::from_le_bytes(*b"cAMD"),
+];
 const ECX_HYPERVISOR: u32 = 1 << 31;
 const EDX_HTT: u32 = 1 << 28;
 const AMD_ECX_CMP_LEGACY: u32 = 1 << 1;
@@ -34,7 +39,7 @@ fn is_amd(entries: &[kvm_cpuid_entry2]) -> bool {
     entries
         .iter()
         .find(|e| e.function == LEAF_VENDOR)
-        .is_some_and(|e| (e.ebx, e.edx, e.ecx) == (0x6874_7541, 0x6974_6e65, 0x444d_4163))
+        .is_some_and(|e| [e.ebx, e.edx, e.ecx] == AMD_VENDOR)
 }
 
 pub fn configure_cpuid(entries: &mut [kvm_cpuid_entry2], topology: CpuTopology) {
@@ -114,9 +119,9 @@ mod tests {
 
     fn intel_entries() -> Vec<kvm_cpuid_entry2> {
         let mut vendor = entry(0, 0);
-        vendor.ebx = 0x756e_6547;
-        vendor.edx = 0x4965_6e69;
-        vendor.ecx = 0x6c65_746e;
+        vendor.ebx = u32::from_le_bytes(*b"Genu");
+        vendor.edx = u32::from_le_bytes(*b"ineI");
+        vendor.ecx = u32::from_le_bytes(*b"ntel");
         let mut features = entry(1, 0);
         features.ebx = 0xffff_0800;
         let mut l1 = entry(4, 0);
@@ -174,9 +179,7 @@ mod tests {
     #[test]
     fn amd_core_count() {
         let mut vendor = entry(0, 0);
-        vendor.ebx = 0x6874_7541;
-        vendor.edx = 0x6974_6e65;
-        vendor.ecx = 0x444d_4163;
+        [vendor.ebx, vendor.edx, vendor.ecx] = AMD_VENDOR;
         let mut entries = vec![vendor, entry(0x8000_0008, 0), entry(0x8000_001e, 0)];
         configure_cpuid(
             &mut entries,

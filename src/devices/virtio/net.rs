@@ -77,6 +77,7 @@ impl Net {
         match self.backend.read_frame(&mut buf) {
             Ok(len) if len >= VNET_HEADER_LEN => {
                 buf.truncate(len);
+                // Version 1 headers always carry num_buffers; without mergeable buffers it is 1.
                 buf[NUM_BUFFERS_OFFSET..VNET_HEADER_LEN].copy_from_slice(&1u16.to_le_bytes());
                 Some(buf)
             }
