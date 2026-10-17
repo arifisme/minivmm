@@ -642,7 +642,16 @@ impl Platform {
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     let status =
                         api_request(&process.host_file(API_SOCKET), r#"{"cmd":"status"}"#).await;
-                    tracing::debug!(vm = %id, total_us = restore.as_micros() as u64, "VMM status after restore: {status:?}");
+                    let vmm_restore_us = status
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .and_then(|v| v["restore_us"].as_u64());
+                    tracing::debug!(
+                        vm = %id,
+                        total_us = restore.as_micros() as u64,
+                        vmm_restore_us,
+                        "VM restored"
+                    );
                 }
                 self.metrics
                     .restore
