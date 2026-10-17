@@ -20,6 +20,7 @@ pub const MAX_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 pub const MAX_CONCURRENCY: u32 = 1000;
 pub const MAX_ENV_BYTES: usize = 4096;
 pub const MAX_NAME_LEN: usize = 63;
+pub const MAX_LOG_ENTRIES: usize = 2000;
 const RESERVED_ENV_PREFIX: &str = "MV_";
 
 fn default_memory_mib() -> u32 {

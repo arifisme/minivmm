@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use mv_proto::api::LogEntry;
 
-pub const PER_FUNCTION: usize = 2000;
+pub const PER_FUNCTION: usize = mv_proto::api::MAX_LOG_ENTRIES;
 
 #[derive(Default)]
 pub struct LogStore {

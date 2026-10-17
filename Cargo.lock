@@ -1073,6 +1073,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "flate2",
+ "humantime",
+ "mv-proto",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+]
+
+[[package]]
 name = "mvd"
 version = "0.1.0"
 dependencies = [
@@ -1081,6 +1097,7 @@ dependencies = [
  "chrono",
  "clap",
  "flate2",
+ "http-body-util",
  "humantime",
  "libc",
  "mv-proto",
@@ -1094,6 +1111,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1338,6 +1356,7 @@ dependencies = [
  "pin-project-lite",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tower",
