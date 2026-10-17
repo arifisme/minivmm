@@ -86,6 +86,104 @@ jobs:
           path: target/tmp/guest-logs
           if-no-files-found: ignore
 
+  platform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install toolchain and packages
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update -q
+          sudo apt-get install -y -q flex bison bc libelf-dev libssl-dev e2fsprogs cpio debootstrap
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Describe the runner
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket|Virtualization'
+          free -m
+          uname -r
+
+      - name: Cache guest artifacts
+        id: guest-cache
+        uses: actions/cache@v4
+        with:
+          path: guest/out
+          key: guest-${{ hashFiles('scripts/build-guest.sh', 'guest/kernel.config', 'guest/rcS', 'guest/inittab', 'guest/initramfs-init', 'guest/vsock-test.c') }}
+
+      - name: Build guest artifacts
+        if: steps.guest-cache.outputs.cache-hit != 'true'
+        run: ./scripts/build-guest.sh
+
+      - name: Cache the python base image
+        uses: actions/cache@v4
+        with:
+          path: guest/build/runtimes/python-base.tar
+          key: python-base-${{ hashFiles('scripts/build-runtimes.sh') }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: platform-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build static binaries
+        run: cargo build --release --target x86_64-unknown-linux-musl -p minivmm -p mv-agent -p mv-example-native
+
+      - name: Build runtime images
+        run: |
+          if [ -f guest/build/runtimes/python-base.tar ]; then
+            sudo mkdir -p guest/build/runtimes
+            sudo tar -C guest/build/runtimes -xf guest/build/runtimes/python-base.tar
+          fi
+          sudo AGENT=target/x86_64-unknown-linux-musl/release/mv-agent ./scripts/build-runtimes.sh
+          if [ ! -f guest/build/runtimes/python-base.tar ]; then
+            sudo tar -C guest/build/runtimes -cf guest/build/runtimes/python-base.tar python-base
+          fi
+          sudo chown -R "$USER" guest/build/runtimes/python-base.tar
+
+      - name: Build platform tests
+        run: |
+          cargo build --release -p mvd
+          cargo test --release -p mvd --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "platform" and .executable != null) | .executable' \
+            > target/platform-test-binary
+          cat target/platform-test-binary
+
+      - name: End-to-end platform tests
+        run: |
+          set -o pipefail
+          sudo "$(cat target/platform-test-binary)" --nocapture --test-threads=1 2>&1 | tee target/platform-output.log
+
+      - name: Show mvd logs
+        if: always()
+        run: |
+          for log in target/tmp/mvd-logs/*.log; do
+            echo "::group::$log"
+            sudo tail -n 300 "$log"
+            echo "::endgroup::"
+          done
+
+      - name: Platform test summary
+        if: always()
+        run: |
+          grep -aE '^test .* \.\.\. |^test result|^failures:|^    [a-z_]+$|took|cold|load:|clock' target/platform-output.log || true
+          grep -a -A12 'panicked at' target/platform-output.log || true
+
+      - name: Remove root-owned test state
+        if: always()
+        run: sudo rm -rf target/tmp/platform target/tmp/platform-base target/tmp/mvd-logs
+
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 30

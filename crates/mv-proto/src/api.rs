@@ -10,6 +10,7 @@ pub const HEADER_START: &str = "x-mv-start";
 pub const HEADER_RESTORE: &str = "x-mv-restore-ms";
 pub const HEADER_VM: &str = "x-mv-vm";
 pub const HEADER_FUNCTION_ERROR: &str = "x-mv-function-error";
+pub const HEADER_FUNCTION_DURATION: &str = "x-mv-function-ms";
 
 pub const MIN_MEMORY_MIB: u32 = 64;
 pub const MAX_MEMORY_MIB: u32 = 8192;
@@ -224,6 +225,15 @@ pub struct VmInfo {
     pub cgroup: String,
     pub jail: String,
     pub invocations: u64,
+    #[serde(default)]
+    pub memory: Option<VmMemory>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmMemory {
+    pub rss_kib: u64,
+    pub pss_kib: u64,
+    pub cgroup_bytes: Option<u64>,
 }
 
 #[cfg(test)]

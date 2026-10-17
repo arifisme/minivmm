@@ -15,6 +15,9 @@ use vmm_sys_util::signal::register_signal_handler;
 use vmm_sys_util::{ioctl_io_nr, ioctl_ior_nr, ioctl_iow_nr, ioctl_iowr_nr};
 
 const KVMIO: u32 = 0xae;
+const TCGETS: u64 = 0x5401;
+const TCSETS: u64 = 0x5402;
+const FIONBIO: u64 = 0x5421;
 const BLOCKED_SYSCALL_EXIT_CODE: i32 = 159;
 const SIGSYS_SYSCALL_OFFSET: usize = 24;
 
@@ -132,9 +135,9 @@ fn vmm_ioctls() -> Vec<u64> {
         KVM_SET_GSI_ROUTING(),
         KVM_IRQFD(),
         KVM_IOEVENTFD(),
-        libc::FIONBIO,
-        libc::TCGETS,
-        libc::TCSETS,
+        FIONBIO,
+        TCGETS,
+        TCSETS,
     ]
     .to_vec()
 }
@@ -261,6 +264,9 @@ mod tests {
         assert_eq!(KVM_IOEVENTFD(), 0x4040_ae79);
         assert_eq!(KVM_GET_IRQCHIP(), 0xc208_ae62);
         assert_eq!(KVM_GET_XSAVE(), 0x9000_aea4);
+        assert_eq!(i128::from(TCGETS), i128::from(libc::TCGETS));
+        assert_eq!(i128::from(TCSETS), i128::from(libc::TCSETS));
+        assert_eq!(i128::from(FIONBIO), i128::from(libc::FIONBIO));
     }
 
     #[test]
