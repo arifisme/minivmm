@@ -26,6 +26,7 @@ const KILL_WAIT: Duration = Duration::from_secs(5);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(3);
 const SYNC_ATTEMPTS: u32 = 3;
 const EXIT_NOTICE: Duration = Duration::from_millis(200);
+const CONSOLE_DRAIN: Duration = Duration::from_millis(20);
 const API_TIMEOUT: Duration = Duration::from_secs(120);
 const EXTRA_PIDS: u32 = 8;
 
@@ -192,6 +193,13 @@ impl VmmProcess {
                 return "lost track of the VMM".to_string();
             }
         }
+    }
+
+    /// The console after the process had a moment to exit, so its last words are included.
+    pub async fn final_console(&mut self) -> Vec<String> {
+        let _ = tokio::time::timeout(EXIT_NOTICE, self.exited()).await;
+        tokio::time::sleep(CONSOLE_DRAIN).await;
+        self.console()
     }
 
     pub fn console(&self) -> Vec<String> {

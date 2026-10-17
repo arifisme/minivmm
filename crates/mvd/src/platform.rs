@@ -653,7 +653,7 @@ impl Platform {
                 ))
             }
             Err(err) => {
-                let console = process.console();
+                let console = process.final_console().await;
                 process.destroy().await;
                 Err(match err {
                     VmError::Exited { reason, .. } => VmError::Exited { reason, console },

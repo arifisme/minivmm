@@ -252,7 +252,10 @@ impl Builder {
                 ]
             })?;
         let result = self.capture_base(&mut process, &dir, &manifest).await;
-        let console = process.console();
+        let console = match &result {
+            Ok(()) => Vec::new(),
+            Err(_) => process.final_console().await,
+        };
         process.destroy().await;
         match result {
             Ok(()) => {
@@ -327,7 +330,10 @@ impl Builder {
             })?;
         let mut logs = Vec::new();
         let result = self.initialize(&mut process, &build, &mut logs).await;
-        let console = process.console();
+        let console = match &result {
+            Ok(_) => Vec::new(),
+            Err(_) => process.final_console().await,
+        };
         process.destroy().await;
         match result {
             Ok(init_duration_ms) => Ok(BuildOutput {

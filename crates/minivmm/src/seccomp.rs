@@ -96,6 +96,8 @@ const VMM_SYSCALLS: &[i64] = &[
     libc::SYS_fsync,
     libc::SYS_fdatasync,
     libc::SYS_ftruncate,
+    // musl implements open() with SYS_open on x86_64, glibc with SYS_openat.
+    libc::SYS_open,
     libc::SYS_openat,
     libc::SYS_lseek,
     libc::SYS_fstat,
