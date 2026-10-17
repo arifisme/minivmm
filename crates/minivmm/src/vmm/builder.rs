@@ -11,7 +11,7 @@ use crate::arch::acpi::write_acpi_tables;
 use crate::arch::layout::{
     ACPI_PM_PORT, COM_PORT_LEN, COM1_PORT, EBDA_START, HIGH_MEMORY_START, I8042_PORT,
     I8042_PORT_LEN, MMIO_GAP_END, PCI_CONFIG_PORT, PCI_CONFIG_PORT_LEN, PCI_MMIO_END,
-    PCI_MMIO_START, SERIAL_IRQ, ZERO_PAGE_START, low_memory_end, ram_layout,
+    PCI_MMIO_START, SERIAL_IRQ, ZERO_PAGE_START, low_memory_end,
 };
 use crate::boot::bzimage::{LoadedKernel, load_bzimage};
 use crate::boot::params::{E820Entry, E820Type, ZeroPage, initrd_address, write_cmdline};
@@ -162,10 +162,10 @@ impl VirtioWiring<'_> {
     }
 }
 
-pub fn build_machine(config: &MachineConfig) -> Result<Machine> {
+pub fn build_machine(config: &MachineConfig, memory: GuestMemory) -> Result<Machine> {
     let kvm = open_kvm()?;
     validate(config, &kvm)?;
-    let memory = Arc::new(GuestMemory::new(&ram_layout(config.mem_size))?);
+    let memory = Arc::new(memory);
     let vm = create_vm(&kvm, &memory)?;
     let exit = Arc::new(ExitSignal::new()?);
     let pio = Arc::new(Bus::new());

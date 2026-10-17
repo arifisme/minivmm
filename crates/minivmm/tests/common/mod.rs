@@ -290,3 +290,16 @@ impl Drop for Vm {
         let _ = self.child.wait();
     }
 }
+
+pub fn memory_usage_kib(pid: u32) -> (u64, u64) {
+    let rollup = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).expect("smaps_rollup");
+    let field = |name: &str| {
+        rollup
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("{name} missing from smaps_rollup"))
+    };
+    (field("Rss:"), field("Pss:"))
+}

@@ -16,6 +16,7 @@ use thiserror::Error;
 use vmm_sys_util::signal::Killable;
 
 use crate::api::{ApiCommand, ApiServer, error_response, parse_command};
+use crate::arch::layout::ram_layout;
 use crate::boot::bzimage::BootError;
 use crate::devices::acpi_pm::AcpiPm;
 use crate::devices::bus::{Bus, BusError};
@@ -37,7 +38,7 @@ use crate::memory::{GuestMemory, MemoryError};
 use crate::seccomp::{
     SeccompError, ThreadKind, apply as apply_filter, build_filter, install_violation_reporter,
 };
-use crate::snapshot::{SnapshotError, SnapshotReader, VmSnapshot, write_snapshot};
+use crate::snapshot::{SnapshotError, VmSnapshot, map_memory, read_snapshot, write_snapshot};
 use crate::sync::LockExt;
 use crate::sys::signal::{SignalFd, block_signals, kick_signal, register_kick_handler};
 use crate::sys::terminal::{RawModeGuard, is_terminal, read_fd};
@@ -103,6 +104,12 @@ pub struct BootConfig {
     pub kernel: PathBuf,
     pub initrd: Option<PathBuf>,
     pub cmdline: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RestoreConfig {
+    pub state: PathBuf,
+    pub memory: PathBuf,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -195,6 +202,7 @@ pub struct Vmm {
     stdin_open: bool,
     tap_registered: bool,
     vmm_filter: Option<BpfProgram>,
+    restore_time: Option<Duration>,
 }
 
 fn prepare_process() -> Result<()> {
@@ -210,7 +218,8 @@ impl Vmm {
         options: &RuntimeOptions,
     ) -> Result<Self> {
         prepare_process()?;
-        let machine = build_machine(&config)?;
+        let memory = GuestMemory::new(&ram_layout(config.mem_size))?;
+        let machine = build_machine(&config, memory)?;
         let kernel = load_guest(boot, &config, &machine.memory)?;
         let setup = BootSetup {
             memory: &machine.memory,
@@ -230,15 +239,16 @@ impl Vmm {
         Self::start(config, machine, options)
     }
 
-    pub fn restore(path: &Path, options: &RuntimeOptions) -> Result<Self> {
+    pub fn restore(source: &RestoreConfig, options: &RuntimeOptions) -> Result<Self> {
+        let started = Instant::now();
         prepare_process()?;
-        let (snapshot, reader) = SnapshotReader::open(path)?;
+        let snapshot = read_snapshot(&source.state)?;
         if snapshot.vcpus.len() != usize::from(snapshot.config.cpus) {
             return Err(SnapshotError::Corrupt("vCPU count mismatch".into()).into());
         }
         let config = snapshot.config.clone();
-        let machine = build_machine(&config)?;
-        reader.load_memory(&machine.memory)?;
+        let memory = map_memory(&source.memory, &ram_layout(config.mem_size))?;
+        let machine = build_machine(&config, memory)?;
         restore_vm_state(&machine.vm, &snapshot.vm)?;
         machine.router.lock_or_recover().restore(snapshot.routing)?;
         machine.serial.lock_or_recover().restore(snapshot.serial);
@@ -252,9 +262,16 @@ impl Vmm {
         for (vcpu, state) in machine.vcpus.iter().zip(&snapshot.vcpus) {
             vcpu.restore_state(state)?;
         }
-        info!("restored {} vCPUs from {}", config.cpus, path.display());
-        let vmm = Self::start(config, machine, options)?;
+        let mut vmm = Self::start(config, machine, options)?;
         vmm.kick_all_queues();
+        let elapsed = started.elapsed();
+        vmm.restore_time = Some(elapsed);
+        info!(
+            "restored {} vCPUs from {} in {} us",
+            vmm.config.cpus,
+            source.state.display(),
+            elapsed.as_micros()
+        );
         Ok(vmm)
     }
 
@@ -320,6 +337,7 @@ impl Vmm {
             stdin_open: true,
             tap_registered: false,
             vmm_filter,
+            restore_time: None,
         })
     }
 
@@ -528,7 +546,7 @@ impl Vmm {
             ApiCommand::Status => return self.status(),
             ApiCommand::Pause => self.pause(),
             ApiCommand::Resume => self.resume(),
-            ApiCommand::Snapshot(path) => self.snapshot(&path),
+            ApiCommand::Snapshot { state, memory } => self.snapshot(&state, &memory),
             ApiCommand::Shutdown => {
                 self.exit.request(ExitReason::HostRequest);
                 Ok(())
@@ -551,12 +569,16 @@ impl Vmm {
         } else {
             "running"
         };
-        Json::object([
+        let mut status = Json::object([
             ("ok", Json::from(true)),
             ("state", Json::from(state)),
             ("vcpus", Json::from(u64::from(self.config.cpus))),
             ("memory_mib", Json::from(self.config.mem_size >> 20)),
-        ])
+        ]);
+        if let (Some(elapsed), Json::Object(fields)) = (self.restore_time, &mut status) {
+            fields.insert("restore_us".into(), Json::from(elapsed.as_micros() as u64));
+        }
+        status
     }
 
     pub fn pause(&mut self) -> Result<()> {
@@ -571,20 +593,20 @@ impl Vmm {
         Ok(())
     }
 
-    pub fn snapshot(&mut self, path: &Path) -> Result<()> {
+    pub fn snapshot(&mut self, state: &Path, memory: &Path) -> Result<()> {
         let was_paused = self.paused;
         self.pause()?;
-        let result = self.write_snapshot(path);
+        let result = self.write_snapshot(state, memory);
         if !was_paused {
             self.resume()?;
         }
         if result.is_ok() {
-            info!("snapshot written to {}", path.display());
+            info!("snapshot written to {}", state.display());
         }
         result
     }
 
-    fn write_snapshot(&mut self, path: &Path) -> Result<()> {
+    fn write_snapshot(&mut self, state: &Path, memory: &Path) -> Result<()> {
         let vcpus = self
             .request_all(|| VcpuRequest::SaveState)?
             .into_iter()
@@ -606,7 +628,7 @@ impl Vmm {
             block: self.block.as_ref().map(|d| d.lock_or_recover().state()),
             net: self.net.as_ref().map(|d| d.lock_or_recover().state()),
         };
-        write_snapshot(path, &snapshot, &self.memory)?;
+        write_snapshot(state, memory, &snapshot, &self.memory)?;
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -13,12 +13,14 @@ use crate::devices::virtio::pci::VirtioPciState;
 use crate::kvm::irq::RoutingState;
 use crate::kvm::vcpu::VcpuState;
 use crate::kvm::vm::VmState;
-use crate::memory::{GuestMemory, MemoryError};
+use crate::memory::{GuestAddress, GuestMemory, MemoryError};
 use crate::vmm::MachineConfig;
 
 const MAGIC: &[u8; 8] = b"MVMSNAP\0";
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
+const HEADER_LEN: usize = 20;
 const MAX_STATE_LEN: u64 = 64 << 20;
+const MEMORY_SUFFIX: &str = ".mem";
 
 #[derive(Debug, Error)]
 pub enum SnapshotError {
@@ -50,70 +52,78 @@ pub struct VmSnapshot {
     pub net: Option<VirtioPciState<()>>,
 }
 
-pub fn write_snapshot(path: &Path, snapshot: &VmSnapshot, memory: &GuestMemory) -> Result<()> {
+pub fn default_memory_path(state_path: &Path) -> PathBuf {
+    let mut path = state_path.as_os_str().to_owned();
+    path.push(MEMORY_SUFFIX);
+    PathBuf::from(path)
+}
+
+fn partial_path(path: &Path) -> PathBuf {
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    PathBuf::from(partial)
+}
+
+pub fn write_snapshot(
+    state_path: &Path,
+    memory_path: &Path,
+    snapshot: &VmSnapshot,
+    memory: &GuestMemory,
+) -> Result<()> {
     let state =
         postcard::to_allocvec(snapshot).map_err(|e| SnapshotError::Corrupt(e.to_string()))?;
-    let partial = path.with_extension("partial");
-    {
-        let mut out = BufWriter::new(File::create(&partial)?);
-        out.write_all(MAGIC)?;
-        out.write_all(&FORMAT_VERSION.to_le_bytes())?;
-        out.write_all(&(state.len() as u64).to_le_bytes())?;
-        out.write_all(&state)?;
-        for region in memory.regions() {
-            memory.write_to(region.start(), &mut out, region.len())?;
-        }
-        out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-    }
-    fs::rename(&partial, path)?;
+    let partial_memory = partial_path(memory_path);
+    let file = File::create(&partial_memory)?;
+    memory.dump_sparse(&file)?;
+    file.sync_all()?;
+    fs::rename(&partial_memory, memory_path)?;
+
+    let partial_state = partial_path(state_path);
+    let mut out = File::create(&partial_state)?;
+    let mut header = Vec::with_capacity(HEADER_LEN + state.len());
+    header.extend_from_slice(MAGIC);
+    header.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    header.extend_from_slice(&(state.len() as u64).to_le_bytes());
+    header.extend_from_slice(&state);
+    out.write_all(&header)?;
+    out.sync_all()?;
+    fs::rename(&partial_state, state_path)?;
     Ok(())
 }
 
-pub struct SnapshotReader {
-    reader: BufReader<File>,
+pub fn read_snapshot(path: &Path) -> Result<VmSnapshot> {
+    let mut file = File::open(path)?;
+    let mut header = [0u8; HEADER_LEN];
+    file.read_exact(&mut header)?;
+    if &header[..8] != MAGIC {
+        return Err(SnapshotError::BadMagic);
+    }
+    let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    if version != FORMAT_VERSION {
+        return Err(SnapshotError::UnsupportedVersion(version));
+    }
+    let mut len = [0u8; 8];
+    len.copy_from_slice(&header[12..HEADER_LEN]);
+    let len = u64::from_le_bytes(len);
+    if len > MAX_STATE_LEN {
+        return Err(SnapshotError::Corrupt(format!(
+            "state length {len} is too large"
+        )));
+    }
+    let mut state = Vec::new();
+    file.take(len + 1).read_to_end(&mut state)?;
+    if state.len() as u64 != len {
+        return Err(SnapshotError::Corrupt(format!(
+            "state holds {} bytes instead of {len}",
+            state.len()
+        )));
+    }
+    postcard::from_bytes(&state).map_err(|e| SnapshotError::Corrupt(e.to_string()))
 }
 
-impl SnapshotReader {
-    pub fn open(path: &Path) -> Result<(VmSnapshot, Self)> {
-        let mut reader = BufReader::new(File::open(path)?);
-        let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic)?;
-        if &magic != MAGIC {
-            return Err(SnapshotError::BadMagic);
-        }
-        let mut word = [0u8; 4];
-        reader.read_exact(&mut word)?;
-        let version = u32::from_le_bytes(word);
-        if version != FORMAT_VERSION {
-            return Err(SnapshotError::UnsupportedVersion(version));
-        }
-        let mut len = [0u8; 8];
-        reader.read_exact(&mut len)?;
-        let len = u64::from_le_bytes(len);
-        if len > MAX_STATE_LEN {
-            return Err(SnapshotError::Corrupt(format!(
-                "state length {len} is too large"
-            )));
-        }
-        let mut state = vec![0u8; len as usize];
-        reader.read_exact(&mut state)?;
-        let snapshot =
-            postcard::from_bytes(&state).map_err(|e| SnapshotError::Corrupt(e.to_string()))?;
-        Ok((snapshot, Self { reader }))
-    }
-
-    pub fn load_memory(mut self, memory: &GuestMemory) -> Result<()> {
-        for region in memory.regions() {
-            memory.read_from(region.start(), &mut self.reader, region.len())?;
-        }
-        let mut extra = [0u8; 1];
-        if self.reader.read(&mut extra)? != 0 {
-            return Err(SnapshotError::Corrupt(
-                "trailing data after guest memory".into(),
-            ));
-        }
-        Ok(())
-    }
+pub fn map_memory(path: &Path, layout: &[(GuestAddress, usize)]) -> Result<GuestMemory> {
+    let file = File::open(path)?;
+    Ok(GuestMemory::from_file(layout, &file)?)
 }
 
 #[cfg(test)]
@@ -122,16 +132,12 @@ mod tests {
 
     use super::*;
     use crate::kvm::vcpu::VcpuState;
-    use crate::memory::GuestAddress;
     use crate::vmm::{DiskConfig, MachineConfig};
 
     const MEMORY_SIZE: usize = 0x2000;
+    const LAYOUT: [(GuestAddress, usize); 1] = [(GuestAddress(0), MEMORY_SIZE)];
 
-    fn memory() -> GuestMemory {
-        GuestMemory::new(&[(GuestAddress(0), MEMORY_SIZE)]).unwrap()
-    }
-
-    fn snapshot_bytes(dir: &TempDir) -> Vec<u8> {
+    fn snapshot_files(dir: &TempDir) -> (Vec<u8>, PathBuf) {
         let snapshot = VmSnapshot {
             config: MachineConfig {
                 cpus: 1,
@@ -152,73 +158,67 @@ mod tests {
             block: None,
             net: None,
         };
-        let memory = memory();
+        let memory = GuestMemory::new(&LAYOUT).unwrap();
         let pattern: Vec<u8> = (0..MEMORY_SIZE).map(|i| (i * 7) as u8).collect();
         memory.write(GuestAddress(0), &pattern).unwrap();
         let path = dir.as_path().join("vm.snap");
-        write_snapshot(&path, &snapshot, &memory).unwrap();
-        fs::read(path).unwrap()
+        write_snapshot(&path, &default_memory_path(&path), &snapshot, &memory).unwrap();
+        (fs::read(&path).unwrap(), default_memory_path(&path))
     }
 
-    fn restore(dir: &TempDir, bytes: &[u8]) -> Result<GuestMemory> {
+    fn decode(dir: &TempDir, bytes: &[u8]) -> Result<VmSnapshot> {
         let path = dir.as_path().join("input.snap");
         fs::write(&path, bytes).unwrap();
-        let (_, reader) = SnapshotReader::open(&path)?;
-        let memory = memory();
-        reader.load_memory(&memory)?;
-        Ok(memory)
-    }
-
-    fn state_end(bytes: &[u8]) -> usize {
-        20 + u64::from_le_bytes(bytes[12..20].try_into().unwrap()) as usize
+        read_snapshot(&path)
     }
 
     #[test]
-    fn round_trip_restores_memory() {
+    fn round_trip_maps_memory() {
         let dir = TempDir::new().unwrap();
-        let bytes = snapshot_bytes(&dir);
-        let restored = restore(&dir, &bytes).unwrap();
+        let (bytes, memory_path) = snapshot_files(&dir);
+        let snapshot = decode(&dir, &bytes).unwrap();
+        assert_eq!(snapshot.config.mem_size, MEMORY_SIZE as u64);
+        assert_eq!(memory_path, dir.as_path().join("vm.snap.mem"));
+        let restored = map_memory(&memory_path, &LAYOUT).unwrap();
         let mut contents = vec![0u8; MEMORY_SIZE];
         restored.read(GuestAddress(0), &mut contents).unwrap();
-        assert_eq!(&bytes[bytes.len() - MEMORY_SIZE..], &contents[..]);
+        assert_eq!(contents, fs::read(&memory_path).unwrap());
+        assert_eq!(contents[7], 49);
+        assert!(map_memory(&memory_path, &[(GuestAddress(0), MEMORY_SIZE * 2)]).is_err());
     }
 
     #[test]
     fn every_truncation_is_an_error() {
         let dir = TempDir::new().unwrap();
-        let bytes = snapshot_bytes(&dir);
-        let cuts = (0..state_end(&bytes) + 64).chain((state_end(&bytes)..bytes.len()).step_by(509));
-        for len in cuts {
-            assert!(restore(&dir, &bytes[..len]).is_err(), "truncated to {len}");
+        let (bytes, _) = snapshot_files(&dir);
+        for len in 0..bytes.len() {
+            assert!(decode(&dir, &bytes[..len]).is_err(), "truncated to {len}");
         }
     }
 
     #[test]
     fn corrupted_headers_are_rejected() {
         let dir = TempDir::new().unwrap();
-        let bytes = snapshot_bytes(&dir);
+        let (bytes, _) = snapshot_files(&dir);
         let mut magic = bytes.clone();
         magic[0] ^= 1;
-        assert!(matches!(
-            restore(&dir, &magic),
-            Err(SnapshotError::BadMagic)
-        ));
+        assert!(matches!(decode(&dir, &magic), Err(SnapshotError::BadMagic)));
         let mut version = bytes.clone();
-        version[8] = 2;
+        version[8] = 1;
         assert!(matches!(
-            restore(&dir, &version),
-            Err(SnapshotError::UnsupportedVersion(2))
+            decode(&dir, &version),
+            Err(SnapshotError::UnsupportedVersion(1))
         ));
         let mut length = bytes.clone();
         length[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(matches!(
-            restore(&dir, &length),
+            decode(&dir, &length),
             Err(SnapshotError::Corrupt(_))
         ));
         let mut trailing = bytes;
         trailing.push(0);
         assert!(matches!(
-            restore(&dir, &trailing),
+            decode(&dir, &trailing),
             Err(SnapshotError::Corrupt(_))
         ));
     }
@@ -226,12 +226,12 @@ mod tests {
     #[test]
     fn corrupted_state_never_panics() {
         let dir = TempDir::new().unwrap();
-        let bytes = snapshot_bytes(&dir);
-        for index in 20..state_end(&bytes) {
+        let (bytes, _) = snapshot_files(&dir);
+        for index in HEADER_LEN..bytes.len() {
             for flip in [0x01, 0x80, 0xff] {
                 let mut corrupted = bytes.clone();
                 corrupted[index] ^= flip;
-                let _ = restore(&dir, &corrupted);
+                let _ = decode(&dir, &corrupted);
             }
         }
     }

@@ -7,6 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use crate::json::Json;
+use crate::snapshot::default_memory_path;
 
 const MAX_REQUEST_LEN: usize = 64 * 1024;
 
@@ -15,7 +16,7 @@ pub enum ApiCommand {
     Status,
     Pause,
     Resume,
-    Snapshot(PathBuf),
+    Snapshot { state: PathBuf, memory: PathBuf },
     Shutdown,
 }
 
@@ -30,12 +31,21 @@ pub fn parse_command(line: &str) -> Result<ApiCommand, String> {
         "pause" => Ok(ApiCommand::Pause),
         "resume" => Ok(ApiCommand::Resume),
         "shutdown" => Ok(ApiCommand::Shutdown),
-        "snapshot" => request
-            .get("path")
-            .and_then(Json::as_str)
-            .filter(|path| !path.is_empty())
-            .map(|path| ApiCommand::Snapshot(PathBuf::from(path)))
-            .ok_or_else(|| "snapshot needs a string \"path\" field".to_string()),
+        "snapshot" => {
+            let path = |field: &str| {
+                request
+                    .get(field)
+                    .and_then(Json::as_str)
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+            };
+            let state = path("path").ok_or("snapshot needs a string \"path\" field")?;
+            let memory = match request.get("mem_path") {
+                None => default_memory_path(&state),
+                Some(_) => path("mem_path").ok_or("\"mem_path\" must be a non-empty string")?,
+            };
+            Ok(ApiCommand::Snapshot { state, memory })
+        }
         other => Err(format!("unknown command {other:?}")),
     }
 }
@@ -188,7 +198,17 @@ mod tests {
         );
         assert_eq!(
             parse_command(r#"{"cmd":"snapshot","path":"/tmp/vm.snap"}"#),
-            Ok(ApiCommand::Snapshot(PathBuf::from("/tmp/vm.snap")))
+            Ok(ApiCommand::Snapshot {
+                state: PathBuf::from("/tmp/vm.snap"),
+                memory: PathBuf::from("/tmp/vm.snap.mem"),
+            })
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"snapshot","path":"/a/vm","mem_path":"/b/ram"}"#),
+            Ok(ApiCommand::Snapshot {
+                state: PathBuf::from("/a/vm"),
+                memory: PathBuf::from("/b/ram"),
+            })
         );
     }
 
@@ -198,6 +218,8 @@ mod tests {
         assert!(parse_command(r#"{"command":"status"}"#).is_err());
         assert!(parse_command(r#"{"cmd":"reboot"}"#).is_err());
         assert!(parse_command(r#"{"cmd":"snapshot"}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"snapshot","path":"/a","mem_path":""}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"snapshot","path":"/a","mem_path":3}"#).is_err());
         assert!(parse_command(r#"{"cmd":"snapshot","path":""}"#).is_err());
         assert!(parse_command(r#"{"cmd":5}"#).is_err());
     }

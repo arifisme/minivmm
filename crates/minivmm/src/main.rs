@@ -8,7 +8,10 @@ use log::{LevelFilter, error, info};
 use minivmm::devices::virtio::net::parse_mac;
 use minivmm::exit::ExitReason;
 use minivmm::logger;
-use minivmm::vmm::{BootConfig, DiskConfig, MachineConfig, NetConfig, RuntimeOptions, Vmm};
+use minivmm::snapshot::default_memory_path;
+use minivmm::vmm::{
+    BootConfig, DiskConfig, MachineConfig, NetConfig, RestoreConfig, RuntimeOptions, Vmm,
+};
 
 const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=k panic=1";
 const DEFAULT_MAC: &str = "06:00:ac:10:00:02";
@@ -38,6 +41,8 @@ struct Cli {
     api: Option<PathBuf>,
     #[arg(long, value_name = "SNAPSHOT", conflicts_with = "kernel")]
     restore: Option<PathBuf>,
+    #[arg(long, value_name = "PATH", conflicts_with = "kernel")]
+    restore_memory: Option<PathBuf>,
     #[arg(long)]
     no_seccomp: bool,
     #[arg(long, default_value = "warn")]
@@ -74,8 +79,16 @@ fn run(cli: Cli) -> Result<ExitReason> {
         seccomp: !cli.no_seccomp,
     };
     let vmm = match (cli.restore, cli.kernel) {
-        (Some(snapshot), _) => Vmm::restore(&snapshot, &options)
-            .with_context(|| format!("failed to restore {}", snapshot.display()))?,
+        (Some(state), _) => {
+            let source = RestoreConfig {
+                memory: cli
+                    .restore_memory
+                    .unwrap_or_else(|| default_memory_path(&state)),
+                state,
+            };
+            Vmm::restore(&source, &options)
+                .with_context(|| format!("failed to restore {}", source.state.display()))?
+        }
         (None, Some(kernel)) => {
             let machine = MachineConfig {
                 cpus: cli.cpus,
@@ -139,6 +152,9 @@ mod tests {
         assert!(Cli::try_parse_from(["minivmm", "--kernel", "k", "--disk-read-only"]).is_err());
         let cli = Cli::try_parse_from(["minivmm", "--restore", "s", "--api", "a"]).unwrap();
         assert_eq!(cli.restore, Some(PathBuf::from("s")));
+        assert!(
+            Cli::try_parse_from(["minivmm", "--kernel", "k", "--restore-memory", "m"]).is_err()
+        );
         let cli = Cli::try_parse_from(["minivmm", "--kernel", "k", "--mac", "02:00:00:00:00:09"])
             .unwrap();
         assert_eq!(cli.mac, [2, 0, 0, 0, 0, 9]);

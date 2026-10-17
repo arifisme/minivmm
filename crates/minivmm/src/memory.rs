@@ -1,4 +1,7 @@
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::ptr::NonNull;
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +15,8 @@ pub enum MemoryError {
     InvalidLayout,
     #[error("failed to map guest memory: {0}")]
     Mmap(io::Error),
+    #[error("memory file holds {actual} bytes but the guest has {expected}")]
+    FileSize { expected: u64, actual: u64 },
     #[error("guest memory I/O failed: {0}")]
     Io(#[from] io::Error),
 }
@@ -70,15 +75,25 @@ unsafe impl Sync for Mapping {}
 
 impl Mapping {
     fn anonymous(len: usize) -> Result<Self> {
-        // SAFETY: anonymous private mapping with no address hint; the result is checked.
+        Self::map(len, libc::MAP_ANONYMOUS, -1, 0)
+    }
+
+    fn private_file(file: &File, offset: u64, len: usize) -> Result<Self> {
+        let offset = libc::off_t::try_from(offset).map_err(|_| MemoryError::InvalidLayout)?;
+        Self::map(len, 0, file.as_raw_fd(), offset)
+    }
+
+    fn map(len: usize, flags: libc::c_int, fd: libc::c_int, offset: libc::off_t) -> Result<Self> {
+        // SAFETY: a private mapping with no address hint; the result is checked. Writes to a
+        // file-backed private mapping go to copy-on-write pages and never reach the file.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
+                libc::MAP_PRIVATE | libc::MAP_NORESERVE | flags,
+                fd,
+                offset,
             )
         };
         if ptr == libc::MAP_FAILED {
@@ -91,7 +106,7 @@ impl Mapping {
 
 impl Drop for Mapping {
     fn drop(&mut self) {
-        // SAFETY: ptr and len describe a mapping created by `anonymous`.
+        // SAFETY: ptr and len describe a mapping created by `map`.
         unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
     }
 }
@@ -135,27 +150,70 @@ pub struct GuestMemory {
 }
 
 const COPY_CHUNK: usize = 1 << 20;
+const PAGE_SIZE: usize = 4096;
 
 impl GuestMemory {
     pub fn new(layout: &[(GuestAddress, usize)]) -> Result<Self> {
+        Self::build(layout, |_, len| Mapping::anonymous(len))
+    }
+
+    /// Maps every region copy-on-write from `file`, which holds the regions back to back in
+    /// address order, so guests restored from the same file share the pages they never write.
+    pub fn from_file(layout: &[(GuestAddress, usize)], file: &File) -> Result<Self> {
+        let expected: u64 = layout.iter().map(|(_, len)| *len as u64).sum();
+        let actual = file.metadata()?.len();
+        if actual != expected {
+            return Err(MemoryError::FileSize { expected, actual });
+        }
+        Self::build(layout, |offset, len| {
+            Mapping::private_file(file, offset, len)
+        })
+    }
+
+    fn build(
+        layout: &[(GuestAddress, usize)],
+        mut map: impl FnMut(u64, usize) -> Result<Mapping>,
+    ) -> Result<Self> {
         let mut sorted = layout.to_vec();
         sorted.sort_by_key(|(start, _)| *start);
         let mut regions: Vec<GuestRegion> = Vec::with_capacity(sorted.len());
+        let mut file_offset = 0u64;
         for (start, len) in sorted {
             let end = start.0.checked_add(len as u64);
             let overlaps = regions.last().is_some_and(|prev| prev.end() > start.0);
-            if len == 0 || end.is_none() || overlaps {
+            if len == 0 || !len.is_multiple_of(PAGE_SIZE) || end.is_none() || overlaps {
                 return Err(MemoryError::InvalidLayout);
             }
             regions.push(GuestRegion {
                 start,
-                mapping: Mapping::anonymous(len)?,
+                mapping: map(file_offset, len)?,
             });
+            file_offset += len as u64;
         }
         if regions.is_empty() {
             return Err(MemoryError::InvalidLayout);
         }
         Ok(Self { regions })
+    }
+
+    /// Writes the regions back to back into `file`, leaving holes for pages that are all
+    /// zeroes so the file stays small and those pages are never read back from disk.
+    pub fn dump_sparse(&self, file: &File) -> Result<()> {
+        file.set_len(0)?;
+        file.set_len(self.total_size())?;
+        let mut chunk = vec![0u8; COPY_CHUNK];
+        let mut file_offset = 0u64;
+        for region in &self.regions {
+            let mut done = 0;
+            while done < region.len() {
+                let n = COPY_CHUNK.min(region.len() - done);
+                self.read(GuestAddress(region.start.0 + done as u64), &mut chunk[..n])?;
+                write_nonzero_pages(file, &chunk[..n], file_offset + done as u64)?;
+                done += n;
+            }
+            file_offset += region.len() as u64;
+        }
+        Ok(())
     }
 
     pub fn regions(&self) -> &[GuestRegion] {
@@ -211,36 +269,37 @@ impl GuestMemory {
         unsafe { std::ptr::write_bytes(dst, byte, len) };
         Ok(())
     }
+}
 
-    pub fn read_from<R: Read>(&self, addr: GuestAddress, reader: &mut R, len: usize) -> Result<()> {
-        self.host_ptr(addr, len)?;
-        let mut chunk = vec![0u8; COPY_CHUNK.min(len)];
-        let mut done = 0;
-        while done < len {
-            let n = chunk.len().min(len - done);
-            reader.read_exact(&mut chunk[..n])?;
-            self.write(GuestAddress(addr.0 + done as u64), &chunk[..n])?;
-            done += n;
-        }
-        Ok(())
-    }
+fn is_zero(page: &[u8]) -> bool {
+    page.iter().fold(0, |acc, byte| acc | byte) == 0
+}
 
-    pub fn write_to<W: Write>(&self, addr: GuestAddress, writer: &mut W, len: usize) -> Result<()> {
-        self.host_ptr(addr, len)?;
-        let mut chunk = vec![0u8; COPY_CHUNK.min(len)];
-        let mut done = 0;
-        while done < len {
-            let n = chunk.len().min(len - done);
-            self.read(GuestAddress(addr.0 + done as u64), &mut chunk[..n])?;
-            writer.write_all(&chunk[..n])?;
-            done += n;
+fn write_nonzero_pages(file: &File, data: &[u8], offset: u64) -> io::Result<()> {
+    let mut run_start = None;
+    for (index, page) in data.chunks(PAGE_SIZE).enumerate() {
+        let start = index * PAGE_SIZE;
+        match (is_zero(page), run_start) {
+            (false, None) => run_start = Some(start),
+            (true, Some(run)) => {
+                file.write_all_at(&data[run..start], offset + run as u64)?;
+                run_start = None;
+            }
+            _ => {}
         }
-        Ok(())
     }
+    if let Some(run) = run_start {
+        file.write_all_at(&data[run..], offset + run as u64)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::MetadataExt;
+
+    use vmm_sys_util::tempfile::TempFile;
+
     use super::*;
 
     fn two_regions() -> GuestMemory {
@@ -255,6 +314,45 @@ mod tests {
             GuestMemory::new(&[(GuestAddress(0), 0x2000), (GuestAddress(0x1000), 0x1000)]).is_err()
         );
         assert!(GuestMemory::new(&[(GuestAddress(u64::MAX - 10), 0x1000)]).is_err());
+        assert!(GuestMemory::new(&[(GuestAddress(0), 0x1800)]).is_err());
+    }
+
+    #[test]
+    fn sparse_dump_maps_back_copy_on_write() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 0x40000), (GuestAddress(0x100000), 0x2000)])
+            .unwrap();
+        mem.write(GuestAddress(0x3000), b"low").unwrap();
+        mem.write(GuestAddress(0x101ffd), b"top").unwrap();
+        let file = TempFile::new().unwrap().into_file();
+        mem.dump_sparse(&file).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0x42000);
+        assert!(file.metadata().unwrap().blocks() * 512 < 0x42000);
+
+        let layout = [(GuestAddress(0x100000), 0x2000), (GuestAddress(0), 0x40000)];
+        let first = GuestMemory::from_file(&layout, &file).unwrap();
+        let second = GuestMemory::from_file(&layout, &file).unwrap();
+        let mut word = [0u8; 3];
+        first.read(GuestAddress(0x101ffd), &mut word).unwrap();
+        assert_eq!(&word, b"top");
+        first.write(GuestAddress(0x3000), b"one").unwrap();
+        second.read(GuestAddress(0x3000), &mut word).unwrap();
+        assert_eq!(&word, b"low");
+        let mut on_disk = [0u8; 3];
+        file.read_exact_at(&mut on_disk, 0x3000).unwrap();
+        assert_eq!(&on_disk, b"low");
+    }
+
+    #[test]
+    fn memory_file_must_match_the_layout() {
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(0x1000).unwrap();
+        assert!(matches!(
+            GuestMemory::from_file(&[(GuestAddress(0), 0x2000)], &file),
+            Err(MemoryError::FileSize {
+                expected: 0x2000,
+                actual: 0x1000
+            })
+        ));
     }
 
     #[test]
@@ -278,18 +376,5 @@ mod tests {
         assert!(mem.read_obj::<u64>(GuestAddress(u64::MAX - 3)).is_err());
         assert!(mem.read_obj::<u8>(GuestAddress(0x12000)).is_err());
         assert!(mem.read_obj::<u8>(GuestAddress(0x11fff)).is_ok());
-    }
-
-    #[test]
-    fn stream_round_trip() {
-        let mem = two_regions();
-        let data: Vec<u8> = (0..0x2000u32).map(|i| i as u8).collect();
-        mem.read_from(GuestAddress(0x10000), &mut data.as_slice(), data.len())
-            .unwrap();
-        let mut out = Vec::new();
-        mem.write_to(GuestAddress(0x10000), &mut out, 0x2000)
-            .unwrap();
-        assert_eq!(out, data);
-        assert_eq!(mem.total_size(), 0x3000);
     }
 }

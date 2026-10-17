@@ -69,3 +69,119 @@ fn snapshot_restores_in_a_fresh_process() {
     restored.send("poweroff\n");
     assert!(restored.wait_exit(BOOT_TIMEOUT).success());
 }
+
+fn restore_args(snapshot: &std::path::Path, socket: &std::path::Path) -> Vec<String> {
+    vec![
+        "--restore".into(),
+        snapshot.display().to_string(),
+        "--api".into(),
+        socket.display().to_string(),
+        "--log-level".into(),
+        "info".into(),
+    ]
+}
+
+fn restore_micros(socket: &std::path::Path) -> u64 {
+    let status = api_request(socket, r#"{"cmd":"status"}"#);
+    let field = status
+        .split("\"restore_us\":")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no restore time in {status}"));
+    field
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or_else(|| panic!("bad restore time in {status}"))
+}
+
+#[test]
+fn clones_restore_independently_from_one_snapshot() {
+    if !environment_ready("clones", &["bzImage", "rootfs.ext4"]) {
+        return;
+    }
+    let disk = copy_rootfs("clones");
+    let socket = scratch_file("clones-source.sock");
+    let snapshot = scratch_file("clones.snap");
+    let mut args = common::kernel_args("console=ttyS0 reboot=k panic=1 root=/dev/vda ro", 1);
+    args.extend([
+        "--disk".into(),
+        disk.display().to_string(),
+        "--disk-read-only".into(),
+        "--api".into(),
+        socket.display().to_string(),
+    ]);
+    let mut source = Vm::start("clones_source", &args);
+    wait_for_path(&socket, COMMAND_TIMEOUT);
+    source.wait_for("minivmm rootfs ready", BOOT_TIMEOUT);
+    source.run("echo shared > /tmp/origin");
+    let response = api_request(
+        &socket,
+        &format!(r#"{{"cmd":"snapshot","path":"{}"}}"#, snapshot.display()),
+    );
+    assert!(response.contains(r#""ok":true"#), "{response}");
+    api_request(&socket, r#"{"cmd":"shutdown"}"#);
+    assert!(source.wait_exit(BOOT_TIMEOUT).success());
+    drop(source);
+
+    let memory = minivmm::snapshot::default_memory_path(&snapshot);
+    let allocated = memory.metadata().unwrap();
+    assert!(
+        std::os::unix::fs::MetadataExt::blocks(&allocated) * 512 < allocated.len(),
+        "the memory file should be sparse"
+    );
+
+    let sockets = [scratch_file("clone-a.sock"), scratch_file("clone-b.sock")];
+    let mut clones: Vec<Vm> = sockets
+        .iter()
+        .enumerate()
+        .map(|(index, socket)| {
+            let vm = Vm::start(&format!("clone_{index}"), &restore_args(&snapshot, socket));
+            wait_for_path(socket, COMMAND_TIMEOUT);
+            vm
+        })
+        .collect();
+    for (index, clone) in clones.iter_mut().enumerate() {
+        let origin = clone.run("cat /tmp/origin");
+        assert!(origin.contains("shared"), "{origin}");
+        clone.run(&format!("echo clone-{index} > /tmp/identity"));
+    }
+    for (index, clone) in clones.iter_mut().enumerate() {
+        let identity = clone.run("cat /tmp/identity");
+        assert!(identity.contains(&format!("clone-{index}")), "{identity}");
+    }
+    for (clone, socket) in clones.iter().zip(&sockets) {
+        let (rss, pss) = common::memory_usage_kib(clone.pid());
+        println!(
+            "clone memory: rss {rss} KiB, pss {pss} KiB, restore {} us",
+            restore_micros(socket)
+        );
+        assert!(pss < rss, "clones should share unmodified pages");
+    }
+    for mut clone in clones {
+        clone.send("poweroff -f\n");
+        assert!(clone.wait_exit(BOOT_TIMEOUT).success());
+    }
+
+    let mut latencies: Vec<u64> = (0..10)
+        .map(|round| {
+            let socket = scratch_file("clone-timing.sock");
+            let mut clone = Vm::start(
+                &format!("clone_timing_{round}"),
+                &restore_args(&snapshot, &socket),
+            );
+            wait_for_path(&socket, COMMAND_TIMEOUT);
+            let micros = restore_micros(&socket);
+            api_request(&socket, r#"{"cmd":"shutdown"}"#);
+            assert!(clone.wait_exit(BOOT_TIMEOUT).success());
+            micros
+        })
+        .collect();
+    latencies.sort_unstable();
+    println!(
+        "restore latency over {} runs: min {} us, median {} us, max {} us",
+        latencies.len(),
+        latencies[0],
+        latencies[latencies.len() / 2],
+        latencies[latencies.len() - 1]
+    );
+}
