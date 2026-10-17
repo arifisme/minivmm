@@ -174,7 +174,10 @@ fn python_functions_keep_state_and_report_errors() {
     assert_eq!(env.body["env"]["MV_FUNCTION_NAME"], "py");
     let remaining = daemon.invoke_ok("py", json!({"action": "remaining"}));
     let left = remaining.body["remaining_ms"].as_u64().unwrap();
-    assert!(left > 3000 && left <= 5000, "{left}");
+    assert!(
+        left > 3000 && left <= 5050,
+        "the guest clock may trail the host: {left}"
+    );
 
     let raised = daemon.invoke("py", json!({"action": "fail"}));
     assert_eq!(raised.status, 500);
