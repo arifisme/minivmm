@@ -352,6 +352,16 @@ impl Launcher {
         }
     }
 
+    /// Build VMs also write their memory into a snapshot, and the dirty page cache is
+    /// charged to their cgroup, so they get room for a second copy of guest memory.
+    pub fn build_limits(&self, memory_mib: u32, vcpus: u8) -> Limits {
+        let limits = self.limits(memory_mib, vcpus);
+        Limits {
+            memory_bytes: limits.memory_bytes + (u64::from(memory_mib) << 20),
+            ..limits
+        }
+    }
+
     pub fn spawn(
         &self,
         id: &str,
@@ -568,6 +578,7 @@ mod tests {
         };
         let launcher = Launcher::new(config, None, 32);
         assert_eq!(launcher.limits(128, 2).memory_bytes, 160 << 20);
+        assert_eq!(launcher.build_limits(128, 2).memory_bytes, 288 << 20);
         let id = launcher.next_id("fn");
         let mut process = launcher
             .spawn(&id, 0, launcher.limits(128, 1), &[], |_| {

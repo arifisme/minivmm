@@ -318,7 +318,7 @@ impl Vmm {
         let event_loop = EventLoop::new()?;
         event_loop.add(machine.exit.event().as_raw_fd(), Token::Exit.encode())?;
         event_loop.add(signals.as_raw_fd(), Token::Signal.encode())?;
-        event_loop.add(io::stdin().as_raw_fd(), Token::Stdin.encode())?;
+        let stdin_pollable = watch_stdin(&event_loop)?;
         register_queues(&event_loop, &machine.block, DeviceKind::Block)?;
         register_queues(&event_loop, &machine.net, DeviceKind::Net)?;
         register_queues(&event_loop, &machine.vsock, DeviceKind::Vsock)?;
@@ -387,8 +387,8 @@ impl Vmm {
             signals,
             event_loop,
             api,
-            stdin_registered: true,
-            stdin_open: true,
+            stdin_registered: stdin_pollable,
+            stdin_open: stdin_pollable,
             tap_registered: false,
             vmm_filter,
             restore_time: None,
@@ -820,6 +820,16 @@ impl Vmm {
                 error!("a vCPU thread panicked");
             }
         }
+    }
+}
+
+/// Regular files and `/dev/null` cannot be watched with epoll, and neither can ever deliver
+/// console input worth waiting for, so such a stdin is treated as closed.
+fn watch_stdin(event_loop: &EventLoop) -> Result<bool> {
+    match event_loop.add(io::stdin().as_raw_fd(), Token::Stdin.encode()) {
+        Ok(()) => Ok(true),
+        Err(err) if err.raw_os_error() == Some(libc::EPERM) => Ok(false),
+        Err(err) => Err(err.into()),
     }
 }
 

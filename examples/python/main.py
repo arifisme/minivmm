@@ -18,6 +18,7 @@ def handler(event, context):
         time.sleep(event.get("ms", 0) / 1000)
         return {"slept_ms": event.get("ms", 0)}
     if action == "random":
+        time.sleep(event.get("ms", 0) / 1000)
         return {"random": os.urandom(32).hex(), "python_random": random.random()}
     if action == "time":
         return {"unix_ms": int(time.time() * 1000)}

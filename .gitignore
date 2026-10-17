@@ -17,3 +17,7 @@ fuzz/target/
 
 #/target
 /guest/build/
+deploy/.terraform/
+deploy/.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup

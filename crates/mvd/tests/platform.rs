@@ -134,6 +134,9 @@ fn native_functions_deploy_invoke_and_delete() {
     daemon.wait_until("the VM is gone", Duration::from_secs(10), || {
         daemon.vms("echo").is_empty() && !std::path::Path::new(&jail).exists()
     });
+    daemon.assert_no_leaks();
+    let entries = fs::read_dir(daemon.data_dir.join("jails")).unwrap().count();
+    assert_eq!(entries, 0, "build and failed-deploy jails are removed too");
 }
 
 #[test]
@@ -295,6 +298,7 @@ fn idle_vms_scale_to_zero_and_come_back() {
     let again = daemon.invoke_ok("napper", json!({}));
     assert_eq!(again.header("x-mv-start").as_deref(), Some("cold"));
     assert_eq!(again.body["invocations"], 1);
+    daemon.assert_no_leaks();
 }
 
 #[test]
@@ -346,6 +350,7 @@ fn guest_crashes_fail_only_their_request() {
     assert_eq!(exited.body["kind"], "runtime_exited");
     assert!(exited.body["error"].as_str().unwrap().contains('7'));
     daemon.invoke_ok("exits", json!({}));
+    daemon.assert_no_leaks();
 }
 
 #[test]
@@ -381,6 +386,7 @@ fn a_killed_vmm_fails_only_its_request() {
     assert!(reply.elapsed < Duration::from_secs(4));
     let next = daemon.invoke_ok("victim", json!({}));
     assert_eq!(next.header("x-mv-start").as_deref(), Some("cold"));
+    daemon.assert_no_leaks();
 }
 
 #[test]
@@ -553,7 +559,7 @@ fn restored_vms_get_fresh_entropy_and_the_current_time() {
             .map(|_| {
                 let daemon = daemon.clone();
                 thread::spawn(move || {
-                    let random = daemon.invoke_ok(function, json!({"action": "random"}));
+                    let random = daemon.invoke_ok(function, json!({"action": "random", "ms": 500}));
                     let time = daemon.invoke_ok(function, json!({"action": "time"}));
                     (random, time, now_ms())
                 })
@@ -636,4 +642,161 @@ fn a_short_load_test_succeeds() {
         latencies[latencies.len() * 99 / 100]
     ));
     assert_eq!(daemon.vms("busy").len(), 8);
+}
+
+#[test]
+fn admission_control_refuses_to_overcommit() {
+    let Some(artifacts) = artifacts("admission_memory") else {
+        return;
+    };
+    let daemon = Arc::new(Daemon::start(
+        "admission-memory",
+        artifacts,
+        &["--memory-limit-mib", "350", "--queue-timeout", "100ms"],
+    ));
+    daemon.deploy_ok(
+        "hungry",
+        native_config(json!({"max_concurrency": 4})),
+        daemon.native_code(),
+    );
+    daemon.deploy_ok("other", native_config(json!({})), daemon.native_code());
+    let burst: Vec<_> = (0..3)
+        .map(|_| {
+            let daemon = daemon.clone();
+            thread::spawn(move || daemon.invoke("hungry", json!({"action": "sleep", "ms": 1500})))
+        })
+        .collect();
+    let replies: Vec<_> = burst.into_iter().map(|h| h.join().unwrap()).collect();
+    let statuses: Vec<u16> = replies.iter().map(|r| r.status).collect();
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 200).count(),
+        2,
+        "{statuses:?}"
+    );
+    let refused = replies.iter().find(|r| r.status == 429).unwrap();
+    assert_eq!(refused.body["kind"], "memory");
+    assert_eq!(refused.header("retry-after").as_deref(), Some("1"));
+    let status = daemon.get("/v1/status");
+    assert_eq!(status.body["capacity"]["memory_reserved_mib"], 320);
+
+    let evicting = daemon.invoke_ok("other", json!({}));
+    assert_eq!(evicting.header("x-mv-start").as_deref(), Some("cold"));
+    assert_eq!(
+        daemon.vms("hungry").len(),
+        1,
+        "an idle VM was evicted to make room"
+    );
+    assert!(
+        daemon
+            .metrics()
+            .contains(r#"mvd_throttled_total{function="hungry",reason="memory"} 1"#)
+    );
+    daemon.assert_no_leaks();
+    drop(daemon);
+
+    let Some(artifacts) = common::artifacts("admission_cpu") else {
+        return;
+    };
+    let daemon = Arc::new(Daemon::start(
+        "admission-cpu",
+        artifacts,
+        &["--vcpu-limit", "2"],
+    ));
+    daemon.deploy_ok(
+        "wide",
+        native_config(json!({"vcpus": 2, "max_concurrency": 4})),
+        daemon.native_code(),
+    );
+    let burst: Vec<_> = (0..2)
+        .map(|_| {
+            let daemon = daemon.clone();
+            thread::spawn(move || daemon.invoke("wide", json!({"action": "sleep", "ms": 1500})))
+        })
+        .collect();
+    let statuses: Vec<(u16, Value)> = burst
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .map(|r| (r.status, r.body["kind"].clone()))
+        .collect();
+    assert!(statuses.contains(&(200, Value::Null)), "{statuses:?}");
+    assert!(statuses.contains(&(429, json!("cpu"))), "{statuses:?}");
+}
+
+#[test]
+fn the_cli_drives_the_platform() {
+    let (Some(artifacts), Some(mvctl)) = (artifacts("cli"), common::mvctl()) else {
+        return;
+    };
+    let daemon = Daemon::start("cli", artifacts, &[]);
+    let dir = common::scratch("cli-function");
+    fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/python/main.py"),
+        dir.join("main.py"),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(&mvctl)
+            .arg("--url")
+            .arg(&daemon.url)
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let (ok, out, err) = run(&[
+        "deploy",
+        "cli-fn",
+        dir.to_str().unwrap(),
+        "--runtime",
+        "python",
+        "--env",
+        "GREETING=hey",
+    ]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("deployed cli-fn revision 1"), "{out}");
+    let (ok, out, err) = run(&[
+        "invoke",
+        "cli-fn",
+        "--data",
+        r#"{"action":"env"}"#,
+        "--verbose",
+    ]);
+    assert!(ok, "{err}");
+    assert!(out.contains("\"GREETING\": \"hey\""), "{out}");
+    assert!(err.contains("start cold"), "{err}");
+    let (ok, out, _) = run(&["list"]);
+    assert!(
+        ok && out.contains("cli-fn") && out.contains("python"),
+        "{out}"
+    );
+    let (ok, out, _) = run(&["status"]);
+    assert!(
+        ok && out.contains("1 functions") && out.contains("cli-fn"),
+        "{out}"
+    );
+    let (ok, out, _) = run(&["logs", "cli-fn"]);
+    assert!(ok && out.contains("python example initialized"), "{out}");
+    let (ok, _, err) = run(&["invoke", "cli-fn", "--data", r#"{"action":"fail"}"#]);
+    assert!(!ok && err.contains("ValueError"), "{err}");
+    let (ok, out, err) = run(&[
+        "bench",
+        "cli-fn",
+        "--requests",
+        "40",
+        "--concurrency",
+        "4",
+        "--json",
+    ]);
+    assert!(ok, "{err}");
+    let summary: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(summary["requests"], 40);
+    assert_eq!(summary["errors"], 0);
+    let (ok, _, err) = run(&["describe", "missing"]);
+    assert!(!ok && err.contains("not_found"), "{err}");
+    let (ok, out, _) = run(&["delete", "cli-fn"]);
+    assert!(ok && out.contains("deleted cli-fn"));
 }

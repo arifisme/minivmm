@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Runs as the instance startup script on every boot; the build only happens once.
+set -euo pipefail
+
+if [[ -x /usr/local/bin/mvd ]]; then
+    systemctl start mvd
+    exit 0
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y -q build-essential git curl jq flex bison bc libelf-dev libssl-dev \
+    e2fsprogs cpio debootstrap musl-tools
+
+if [[ ! -e /dev/kvm ]]; then
+    echo "nested virtualization is not enabled on this instance" >&2
+    exit 1
+fi
+
+export HOME=/root
+curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+source "$HOME/.cargo/env"
+rustup target add x86_64-unknown-linux-musl
+
+SRC=/opt/mvd-src
+rm -rf "$SRC"
+git clone --quiet "${repository}" "$SRC"
+git -C "$SRC" checkout --quiet "${git_ref}"
+cd "$SRC"
+
+./scripts/build-guest.sh
+cargo build --release --target x86_64-unknown-linux-musl -p minivmm -p mv-agent
+cargo build --release -p mvd -p mvctl
+AGENT="$SRC/target/x86_64-unknown-linux-musl/release/mv-agent" ./scripts/build-runtimes.sh
+
+install -m 0755 target/x86_64-unknown-linux-musl/release/minivmm /usr/local/bin/minivmm
+install -m 0755 target/release/mvd target/release/mv-jailer target/release/mvctl /usr/local/bin/
+install -d /usr/local/share/mvd/runtimes
+install -m 0444 guest/out/bzImage /usr/local/share/mvd/bzImage
+install -m 0444 guest/out/runtimes/*.ext4 /usr/local/share/mvd/runtimes/
+
+install -d -m 0700 /etc/mvd
+umask 077
+printf 'MVD_API_TOKEN=%s\n' '${api_token}' > /etc/mvd/mvd.env
+cat > /etc/systemd/system/mvd.service <<'UNIT'
+${mvd_service}
+UNIT
+systemctl daemon-reload
+systemctl enable --now mvd

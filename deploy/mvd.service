@@ -1,0 +1,25 @@
+[Unit]
+Description=mvd serverless function platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/mvd/mvd.env
+ExecStart=/usr/local/bin/mvd \
+    --listen 0.0.0.0:8080 \
+    --data-dir /var/lib/mvd \
+    --kernel /usr/local/share/mvd/bzImage \
+    --runtime-dir /usr/local/share/mvd/runtimes \
+    --vmm /usr/local/bin/minivmm \
+    --jailer /usr/local/bin/mv-jailer \
+    --log-format json
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

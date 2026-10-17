@@ -55,7 +55,10 @@ fn handle(event: &Value, invocations: u64) -> Result<Value, String> {
             }
             Ok(json!({ "iterations": counter }))
         }
-        "random" => Ok(json!({ "random": random_hex(32).map_err(|e| e.to_string())? })),
+        "random" => {
+            thread::sleep(Duration::from_millis(number("ms")));
+            Ok(json!({ "random": random_hex(32).map_err(|e| e.to_string())? }))
+        }
         "time" => Ok(json!({ "unix_ms": unix_ms() as u64 })),
         "env" => {
             let env: BTreeMap<String, String> = std::env::vars().collect();

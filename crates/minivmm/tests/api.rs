@@ -49,3 +49,25 @@ fn control_socket_pauses_resumes_and_shuts_down() {
     assert!(vm.wait_exit(BOOT_TIMEOUT).success());
     assert!(!socket.exists(), "API socket should be removed on exit");
 }
+
+#[test]
+fn runs_with_stdin_from_dev_null() {
+    if !environment_ready("api_null_stdin", &["bzImage", "initramfs.cpio.gz"]) {
+        return;
+    }
+    let socket = scratch_file("null-stdin.sock");
+    let mut args = kernel_args("console=ttyS0 reboot=k panic=1", 1);
+    args.extend([
+        "--initrd".into(),
+        artifact("initramfs.cpio.gz").display().to_string(),
+        "--api".into(),
+        socket.display().to_string(),
+    ]);
+    let mut vm = Vm::start_without_stdin("api_null_stdin", &args);
+    wait_for_path(&socket, COMMAND_TIMEOUT);
+    vm.wait_for("minivmm initramfs ready", BOOT_TIMEOUT);
+    let status = api_request(&socket, r#"{"cmd":"status"}"#);
+    assert!(status.contains(r#""state":"running""#), "{status}");
+    api_request(&socket, r#"{"cmd":"shutdown"}"#);
+    assert!(vm.wait_exit(BOOT_TIMEOUT).success());
+}

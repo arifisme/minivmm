@@ -227,7 +227,7 @@ impl Builder {
         let rootfs = Bind::new(self.images.rootfs(runtime), "/rootfs.ext4");
         let binds = [kernel.clone(), rootfs.clone()];
         let id = self.launcher.next_id(&format!("base-{runtime}"));
-        let limits = self.launcher.limits(memory_mib, vcpus);
+        let limits = self.launcher.build_limits(memory_mib, vcpus);
         let mut process = self
             .launcher
             .spawn(&id, self.build_uid, limits, &binds, |jail| {
@@ -317,7 +317,9 @@ impl Builder {
         let id = self
             .launcher
             .next_id(&format!("build-{}", build.setup.name));
-        let limits = self.launcher.limits(build.setup.memory_mib, build.vcpus);
+        let limits = self
+            .launcher
+            .build_limits(build.setup.memory_mib, build.vcpus);
         let mut process = self
             .launcher
             .spawn(&id, build.uid, limits, &binds, |jail| {

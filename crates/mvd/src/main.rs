@@ -46,6 +46,23 @@ fn init_tracing(format: LogFormat) {
     }
 }
 
+/// Each VM holds a few descriptors in the daemon (agent socket, console pipes), so the
+/// default soft limit of 1024 would cap the number of VMs.
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit receive a valid rlimit structure.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 && limit.rlim_cur < limit.rlim_max
+        {
+            limit.rlim_cur = limit.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    }
+}
+
 fn default_jailer() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     Ok(exe.with_file_name("mv-jailer"))
@@ -93,6 +110,7 @@ async fn run(options: Options) -> anyhow::Result<()> {
         None => default_jailer()?,
     };
     check_inputs(&options, &jailer)?;
+    raise_open_file_limit();
     fs::create_dir_all(&options.data_dir)?;
     fs::set_permissions(&options.data_dir, fs::Permissions::from_mode(0o700))?;
     let jails = options.data_dir.join("jails");

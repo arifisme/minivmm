@@ -163,6 +163,10 @@ impl Vm {
         Self::spawn(name, args, Stdio::piped())
     }
 
+    pub fn start_without_stdin(name: &str, args: &[String]) -> Self {
+        Self::spawn(name, args, Stdio::null())
+    }
+
     pub fn start_with_stdin(name: &str, args: &[String], tty: std::os::fd::RawFd) -> Self {
         // SAFETY: duplicating a descriptor owned by the caller for the child's stdin.
         let fd = unsafe { libc::dup(tty) };

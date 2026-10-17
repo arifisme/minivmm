@@ -88,7 +88,7 @@ jobs:
 
   platform:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
 
@@ -169,16 +169,24 @@ jobs:
 
       - name: Build platform tests
         run: |
-          cargo build --release -p mvd
-          cargo test --release -p mvd --no-run --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "platform" and .executable != null) | .executable' \
-            > target/platform-test-binary
-          cat target/platform-test-binary
+          cargo build --release -p mvd -p mvctl
+          cargo test --release -p mvd --no-run --message-format=json > target/test-artifacts.json
+          for test in platform benchmark; do
+            jq -r "select(.reason == \"compiler-artifact\" and .target.name == \"$test\" and .executable != null) | .executable" \
+              target/test-artifacts.json > "target/$test-test-binary"
+          done
+          cat target/*-test-binary
 
       - name: End-to-end platform tests
         run: |
           set -o pipefail
           sudo "$(cat target/platform-test-binary)" --nocapture --test-threads=1 2>&1 | tee target/platform-output.log
+
+      - name: Benchmarks
+        run: |
+          set -o pipefail
+          sudo "$(cat target/benchmark-test-binary)" --ignored --nocapture --test-threads=1 2>&1 | tee target/benchmark-output.log
+          grep -a 'BENCH' target/benchmark-output.log
 
       - name: Show mvd logs
         if: always()
@@ -198,6 +206,23 @@ jobs:
       - name: Remove root-owned test state
         if: always()
         run: sudo rm -rf target/tmp/platform target/tmp/platform-base target/tmp/mvd-logs
+
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Check the deployment configuration
+        working-directory: deploy
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
 
   fuzz:
     runs-on: ubuntu-latest

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::TcpListener;
@@ -345,6 +346,39 @@ impl Daemon {
         }
     }
 
+    pub fn cgroup_root(&self) -> &Path {
+        &self.cgroup_root
+    }
+
+    /// Every jail directory and cgroup must belong to a VM the daemon reports as live.
+    pub fn assert_no_leaks(&self) {
+        let live = |dir: &Path| -> HashSet<String> {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return HashSet::new();
+            };
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        self.wait_until(
+            "jails and cgroups match the live VMs",
+            Duration::from_secs(15),
+            || {
+                let reply = self.get("/v1/vms");
+                let vms: HashSet<String> = reply
+                    .body
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|vm| vm["id"].as_str().unwrap().to_string())
+                    .collect();
+                live(&self.data_dir.join("jails")) == vms && live(&self.cgroup_root) == vms
+            },
+        );
+    }
+
     pub fn wait_until(&self, what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
         let deadline = Instant::now() + timeout;
         while !check() {
@@ -411,6 +445,11 @@ fn merge(config: &mut Value, extra: Value) {
     if let (Some(config), Value::Object(extra)) = (config.as_object_mut(), extra) {
         config.extend(extra);
     }
+}
+
+pub fn mvctl() -> Option<PathBuf> {
+    let path = env_path("MV_CTL", "target/release/mvctl");
+    path.exists().then_some(path)
 }
 
 pub fn report(line: &str) {
