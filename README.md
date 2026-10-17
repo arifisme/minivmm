@@ -304,7 +304,8 @@ target/release/minivmm --kernel guest/out/bzImage \
 `CONNECT <port>\n`; the VMM answers `OK <host port>\n` once the guest accepts, then the
 socket carries the stream. Guest connections to the host (CID 2) port `P` are forwarded to
 the Unix socket `<uds>_<P>`. After a restore the guest receives a transport reset, so
-listening sockets survive and stale connections are closed.
+listening sockets survive and stale connections are closed; host connections made before
+the guest has finished handling the reset are held until it has.
 
 **Snapshots.** The state file holds `MVMSNAP\0`, the format version (2), and the
 postcard-encoded machine configuration and device state (vCPU registers, irqchips, clock,

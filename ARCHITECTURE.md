@@ -148,5 +148,6 @@ flowchart TD
 - **SQLite for metadata, files for everything else.** Metadata changes are rare and small;
   code and snapshots are large immutable files written atomically per revision.
 - **Snapshots are taken with the host connection closed.** Host Unix sockets cannot be part of
-  a snapshot, so the VMM sends a vsock `TRANSPORT_RESET` after restore and the host reconnects
-  (retrying once if the reset races with the new connection).
+  a snapshot, so the VMM sends a vsock `TRANSPORT_RESET` after restore. Host connections
+  made meanwhile are held back until the guest re-posts its event buffer, which Linux does only
+  after it has dropped every stale socket, so the reset cannot kill a new connection.
