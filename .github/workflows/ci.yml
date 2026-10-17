@@ -74,7 +74,9 @@ jobs:
 
       - name: Test summary
         if: always()
-        run: grep -aE '^test .* \.\.\. |panicked at|^test result|^failures:|^    [a-z_]+$' target/test-output.log || true
+        run: |
+          grep -aE '^test .* \.\.\. |^test result|^failures:|^    [a-z_]+$|^(clone memory|restore latency)' target/test-output.log || true
+          grep -a -A6 'panicked at' target/test-output.log || true
 
       - name: Upload logs
         if: always()

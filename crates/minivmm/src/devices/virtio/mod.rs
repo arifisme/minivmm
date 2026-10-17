@@ -2,6 +2,7 @@ pub mod block;
 pub mod net;
 pub mod pci;
 pub mod queue;
+pub mod vsock;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -12,6 +13,7 @@ use queue::{Queue, QueueError};
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 pub const TYPE_NET: u32 = 1;
 pub const TYPE_BLOCK: u32 = 2;
+pub const TYPE_VSOCK: u32 = 19;
 
 pub type QueueMask = u64;
 

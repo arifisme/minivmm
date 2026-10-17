@@ -90,6 +90,7 @@ const VMM_SYSCALLS: &[i64] = &[
     libc::SYS_pwrite64,
     libc::SYS_fsync,
     libc::SYS_fdatasync,
+    libc::SYS_ftruncate,
     libc::SYS_openat,
     libc::SYS_lseek,
     libc::SYS_fstat,
