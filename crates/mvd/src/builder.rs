@@ -248,7 +248,7 @@ impl Builder {
                     "--api".into(),
                     path_arg(jail.vmm_file(API_SOCKET)),
                     "--log-level".into(),
-                    "warn".into(),
+                    "info".into(),
                 ]
             })?;
         let result = self.capture_base(&mut process, &dir, &manifest).await;
@@ -398,7 +398,11 @@ impl Builder {
     }
 }
 
-pub fn restore_args(jail: &crate::jail::JailDir, binds: &[Bind; 3]) -> Vec<String> {
+pub fn restore_args(
+    jail: &crate::jail::JailDir,
+    binds: &[Bind; 3],
+    log_level: &str,
+) -> Vec<String> {
     vec![
         "--restore".into(),
         path_arg(jail.vmm_path(&binds[0])),
@@ -409,7 +413,7 @@ pub fn restore_args(jail: &crate::jail::JailDir, binds: &[Bind; 3]) -> Vec<Strin
         "--api".into(),
         path_arg(jail.vmm_file(API_SOCKET)),
         "--log-level".into(),
-        "warn".into(),
+        log_level.into(),
     ]
 }
 

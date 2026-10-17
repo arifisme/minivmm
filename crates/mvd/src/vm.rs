@@ -197,9 +197,14 @@ impl VmmProcess {
 
     /// The console after the process had a moment to exit, so its last words are included.
     pub async fn final_console(&mut self) -> Vec<String> {
-        let _ = tokio::time::timeout(EXIT_NOTICE, self.exited()).await;
+        let status = match tokio::time::timeout(EXIT_NOTICE, self.exited()).await {
+            Ok(reason) => format!("the VMM {reason}"),
+            Err(_) => "the VMM was still running".to_string(),
+        };
         tokio::time::sleep(CONSOLE_DRAIN).await;
-        self.console()
+        let mut console = self.console();
+        console.push(status);
+        console
     }
 
     pub fn console(&self) -> Vec<String> {
