@@ -629,7 +629,7 @@ impl Platform {
         let mut process = self
             .launcher
             .spawn(&id, target.uid, limits, &binds, |jail| {
-                restore_args(jail, &binds)
+                restore_args(jail, &binds, "warn")
             })?;
         match self
             .launcher

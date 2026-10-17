@@ -326,7 +326,7 @@ impl Builder {
         let mut process = self
             .launcher
             .spawn(&id, build.uid, limits, &binds, |jail| {
-                restore_args(jail, &binds)
+                restore_args(jail, &binds, "info")
             })?;
         let mut logs = Vec::new();
         let result = self.initialize(&mut process, &build, &mut logs).await;
