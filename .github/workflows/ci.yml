@@ -191,7 +191,7 @@ jobs:
           grep -a 'BENCH' target/benchmark-output.log
 
       - name: Show mvd logs
-        if: always()
+        if: failure()
         run: |
           for log in target/tmp/mvd-logs/*.log; do
             echo "::group::$log"
@@ -204,6 +204,11 @@ jobs:
         run: |
           grep -a -A12 'panicked at' target/platform-output.log || true
           grep -aE '^test .* \.\.\. |^test result|^failures:|^    [a-z_]+$|took|cold|load:|clock' target/platform-output.log || true
+          sudo grep -ahE 'cannot start a VM|WARN|ERROR' target/tmp/mvd-logs/*.log | grep -v 'deploy failed' | tail -n 40 || true
+
+      - name: Benchmark summary
+        if: always()
+        run: grep -a 'BENCH' target/benchmark-output.log || true
 
       - name: Remove root-owned test state
         if: always()
