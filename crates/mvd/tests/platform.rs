@@ -713,12 +713,17 @@ fn admission_control_refuses_to_overcommit() {
             thread::spawn(move || daemon.invoke("wide", json!({"action": "sleep", "ms": 1500})))
         })
         .collect();
-    let statuses: Vec<(u16, Value)> = burst
-        .into_iter()
-        .map(|h| h.join().unwrap())
+    let replies: Vec<common::Reply> = burst.into_iter().map(|h| h.join().unwrap()).collect();
+    let statuses: Vec<(u16, Value)> = replies
+        .iter()
         .map(|r| (r.status, r.body["kind"].clone()))
         .collect();
-    assert!(statuses.contains(&(200, Value::Null)), "{statuses:?}");
+    let bodies: Vec<&Value> = replies.iter().map(|r| &r.body).collect();
+    assert!(
+        statuses.contains(&(200, Value::Null)),
+        "{bodies:?}\n{}",
+        daemon.get("/v1/functions/wide/logs?limit=50").body
+    );
     assert!(statuses.contains(&(429, json!("cpu"))), "{statuses:?}");
 }
 

@@ -202,8 +202,8 @@ jobs:
       - name: Platform test summary
         if: always()
         run: |
-          grep -aE '^test .* \.\.\. |^test result|^failures:|^    [a-z_]+$|took|cold|load:|clock' target/platform-output.log || true
           grep -a -A12 'panicked at' target/platform-output.log || true
+          grep -aE '^test .* \.\.\. |^test result|^failures:|^    [a-z_]+$|took|cold|load:|clock' target/platform-output.log || true
 
       - name: Remove root-owned test state
         if: always()
