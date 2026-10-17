@@ -36,6 +36,16 @@ pub struct Interest {
     pub write: bool,
 }
 
+/// Progress of the transport reset sent after a restore. The guest re-posts the event buffer
+/// only after it has dropped every stale connection, so host connections are held back until
+/// then; otherwise the reset can race with a new connection and silently kill it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportReset {
+    Idle,
+    Pending,
+    Delivered { avail_index: u16 },
+}
+
 pub struct Vsock {
     cid: u64,
     backend: Box<dyn VsockBackend>,
@@ -43,7 +53,8 @@ pub struct Vsock {
     next_id: u32,
     next_local_port: u32,
     control: VecDeque<Header>,
-    reset_pending: bool,
+    reset: TransportReset,
+    deferred_requests: Vec<u32>,
     cursor: u32,
 }
 
@@ -56,7 +67,8 @@ impl Vsock {
             next_id: 0,
             next_local_port: LOCAL_PORT_BASE,
             control: VecDeque::new(),
-            reset_pending: false,
+            reset: TransportReset::Idle,
+            deferred_requests: Vec::new(),
             cursor: 0,
         }
     }
@@ -96,7 +108,11 @@ impl Vsock {
         let host_port = self.allocate_local_port();
         let conn = Connection::new(stream, host_port, port, State::Connecting, early_data);
         self.insert(conn);
-        self.queue_control(Op::Request, host_port, port, 0, 0);
+        if self.reset == TransportReset::Idle {
+            self.queue_control(Op::Request, host_port, port, 0, 0);
+        } else {
+            self.deferred_requests.push(host_port);
+        }
         true
     }
 
@@ -446,26 +462,47 @@ impl Vsock {
         }
     }
 
-    fn send_reset_event(
+    fn advance_reset(
         &mut self,
         mem: &GuestMemory,
         queues: &mut [Queue],
     ) -> Result<QueueMask, QueueError> {
-        if !self.reset_pending {
-            return Ok(0);
-        }
         let Some(queue) = queues.get_mut(EVENT_QUEUE) else {
             return Ok(0);
         };
-        let Some(chain) = queue.pop(mem)? else {
-            return Ok(0);
-        };
-        let written = chain
-            .writer()
-            .write(mem, &EVENT_TRANSPORT_RESET.to_le_bytes())?;
-        queue.add_used(mem, chain.head, written as u32)?;
-        self.reset_pending = false;
-        Ok(queue_bit(EVENT_QUEUE))
+        match self.reset {
+            TransportReset::Idle => Ok(0),
+            TransportReset::Pending => {
+                let Some(chain) = queue.pop(mem)? else {
+                    return Ok(0);
+                };
+                let written = chain
+                    .writer()
+                    .write(mem, &EVENT_TRANSPORT_RESET.to_le_bytes())?;
+                queue.add_used(mem, chain.head, written as u32)?;
+                self.reset = TransportReset::Delivered {
+                    avail_index: queue.avail_index(mem)?,
+                };
+                Ok(queue_bit(EVENT_QUEUE))
+            }
+            TransportReset::Delivered { avail_index } => {
+                if queue.avail_index(mem)? == avail_index {
+                    return Ok(0);
+                }
+                self.reset = TransportReset::Idle;
+                for host_port in std::mem::take(&mut self.deferred_requests) {
+                    let guest_port = self
+                        .connections
+                        .values()
+                        .find(|c| c.host_port == host_port && c.state == State::Connecting)
+                        .map(|c| c.guest_port);
+                    if let Some(guest_port) = guest_port {
+                        self.queue_control(Op::Request, host_port, guest_port, 0, 0);
+                    }
+                }
+                self.fill_rx(mem, queues)
+            }
+        }
     }
 }
 
@@ -495,7 +532,8 @@ impl VirtioDevice for Vsock {
     fn reset(&mut self) {
         self.connections.clear();
         self.control.clear();
-        self.reset_pending = false;
+        self.deferred_requests.clear();
+        self.reset = TransportReset::Idle;
     }
 
     fn process_queue(
@@ -511,7 +549,7 @@ impl VirtioDevice for Vsock {
                 mask |= self.fill_rx(mem, queues)?;
                 Ok(mask)
             }
-            EVENT_QUEUE => self.send_reset_event(mem, queues),
+            EVENT_QUEUE => self.advance_reset(mem, queues),
             _ => Ok(0),
         }
     }
@@ -522,7 +560,7 @@ impl VirtioDevice for Vsock {
     /// every connection it remembers as soon as it has an event buffer.
     fn restore(&mut self, _: ()) {
         self.reset();
-        self.reset_pending = true;
+        self.reset = TransportReset::Pending;
     }
 }
 
@@ -1012,12 +1050,21 @@ mod tests {
     }
 
     #[test]
-    fn restore_announces_a_transport_reset() {
+    fn restore_announces_a_transport_reset_before_new_connections() {
         let mut h = Harness::new();
         h.connect_from_host(b"");
         h.vsock.restore(());
         assert!(h.vsock.connections.is_empty());
         assert_eq!(h.process(EVENT_QUEUE), 0);
+        let stream = FakeStream::default();
+        assert!(
+            h.vsock
+                .connect_from_host(Box::new(stream.clone()), GUEST_PORT, Vec::new())
+        );
+        h.post_rx(2);
+        h.fill();
+        assert!(h.received().is_empty(), "requests wait for the reset");
+        h.post(EVENT_QUEUE, &[0xff; 4], 4, true);
         h.post(EVENT_QUEUE, &[0xff; 4], 4, true);
         assert_eq!(h.process(EVENT_QUEUE), queue_bit(EVENT_QUEUE));
         let used: u32 = h
@@ -1031,7 +1078,19 @@ mod tests {
             .unwrap();
         let event: u32 = h.mem.read_obj(GuestAddress(addr)).unwrap();
         assert_eq!(event, EVENT_TRANSPORT_RESET);
+        assert_eq!(h.process(EVENT_QUEUE), 0);
+        assert!(
+            h.received().is_empty(),
+            "the guest has not finished the reset"
+        );
         h.post(EVENT_QUEUE, &[0xff; 4], 4, true);
+        assert_eq!(h.process(EVENT_QUEUE), queue_bit(RX_QUEUE));
+        let packets = h.received();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].0.op(), Some(Op::Request));
+        assert_eq!(packets[0].0.dst_port, GUEST_PORT);
+        h.send(guest_header(Op::Response, packets[0].0.src_port, 0), &[]);
+        assert!(stream.0.lock().unwrap().outgoing.starts_with(b"OK "));
         assert_eq!(h.process(EVENT_QUEUE), 0);
     }
 

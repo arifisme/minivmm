@@ -256,7 +256,7 @@ impl Queue {
         self.next_used
     }
 
-    fn avail_index(&self, mem: &GuestMemory) -> Result<u16> {
+    pub fn avail_index(&self, mem: &GuestMemory) -> Result<u16> {
         Ok(mem.read_obj(GuestAddress(self.avail_ring.raw() + RING_INDEX_OFFSET))?)
     }
 
