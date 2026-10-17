@@ -50,6 +50,7 @@ pub struct VmSnapshot {
     pub pci: PciRootState,
     pub block: Option<VirtioPciState<()>>,
     pub net: Option<VirtioPciState<()>>,
+    pub vsock: Option<VirtioPciState<()>>,
 }
 
 pub fn default_memory_path(state_path: &Path) -> PathBuf {
@@ -147,6 +148,7 @@ mod tests {
                     read_only: true,
                 }),
                 net: None,
+                vsock: None,
             },
             vm: VmState::default(),
             routing: RoutingState::default(),
@@ -157,6 +159,7 @@ mod tests {
             pci: PciRootState::default(),
             block: None,
             net: None,
+            vsock: None,
         };
         let memory = GuestMemory::new(&LAYOUT).unwrap();
         let pattern: Vec<u8> = (0..MEMORY_SIZE).map(|i| (i * 7) as u8).collect();

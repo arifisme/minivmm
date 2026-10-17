@@ -59,6 +59,11 @@ build_dropbear() {
     DROPBEAR="$src/dropbear"
 }
 
+build_vsock_test() {
+    VSOCK_TEST="$WORK/vsock-test"
+    gcc -static -O2 -Wall -Werror -o "$VSOCK_TEST" "$ROOT/guest/vsock-test.c"
+}
+
 install_busybox() {
     local root="$1"
     mkdir -p "$root"/{bin,sbin,usr/bin,usr/sbin,dev,proc,sys,tmp,etc,root}
@@ -83,6 +88,7 @@ build_rootfs() {
     install_busybox "$root"
     mkdir -p "$root"/{etc/init.d,etc/dropbear,usr/sbin,var/run,mnt}
     cp "$DROPBEAR" "$root/usr/sbin/dropbear"
+    cp "$VSOCK_TEST" "$root/usr/bin/vsock-test"
     cp "$ROOT/guest/rcS" "$root/etc/init.d/rcS"
     cp "$ROOT/guest/inittab" "$root/etc/inittab"
     chmod 755 "$root/etc/init.d/rcS"
@@ -96,6 +102,7 @@ build_rootfs() {
 build_kernel
 fetch_busybox
 build_dropbear
+build_vsock_test
 build_initramfs
 build_rootfs
 ls -l "$OUT"

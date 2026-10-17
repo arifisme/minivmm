@@ -82,6 +82,8 @@ const VMM_SYSCALLS: &[i64] = &[
     libc::SYS_epoll_pwait,
     libc::SYS_epoll_ctl,
     libc::SYS_accept4,
+    libc::SYS_connect,
+    libc::SYS_shutdown,
     libc::SYS_recvfrom,
     libc::SYS_sendto,
     libc::SYS_readv,
@@ -158,6 +160,16 @@ fn non_executable_rule() -> Result<Vec<SeccompRule>, SeccompError> {
     Ok(vec![SeccompRule::new(vec![condition])?])
 }
 
+fn unix_socket_rule() -> Result<Vec<SeccompRule>, SeccompError> {
+    let condition = SeccompCondition::new(
+        0,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Eq,
+        libc::AF_UNIX as u64,
+    )?;
+    Ok(vec![SeccompRule::new(vec![condition])?])
+}
+
 pub fn build_filter(kind: ThreadKind) -> Result<BpfProgram, SeccompError> {
     let (extra, ioctls) = match kind {
         ThreadKind::Vmm => (VMM_SYSCALLS, vmm_ioctls()),
@@ -169,6 +181,9 @@ pub fn build_filter(kind: ThreadKind) -> Result<BpfProgram, SeccompError> {
         .map(|syscall| (*syscall, Vec::new()))
         .collect();
     rules.insert(libc::SYS_ioctl, ioctl_rules(&ioctls)?);
+    if kind == ThreadKind::Vmm {
+        rules.insert(libc::SYS_socket, unix_socket_rule()?);
+    }
     rules.insert(libc::SYS_mmap, non_executable_rule()?);
     rules.insert(libc::SYS_mprotect, non_executable_rule()?);
     let filter = SeccompFilter::new(
@@ -372,5 +387,27 @@ mod tests {
             }
             assert_eq!(run_filtered_child(kind, make_writable, |_| {}), 0);
         }
+    }
+
+    #[test]
+    fn only_unix_sockets_can_be_created() {
+        fn open_socket(family: libc::c_int) {
+            // SAFETY: creating a socket in the forked child; it is never used.
+            if unsafe { libc::socket(family, libc::SOCK_STREAM, 0) } < 0 {
+                // SAFETY: exiting the forked child.
+                unsafe { libc::_exit(4) };
+            }
+        }
+        let unix = || open_socket(libc::AF_UNIX);
+        let inet = || open_socket(libc::AF_INET);
+        assert_eq!(run_filtered_child(ThreadKind::Vmm, unix, |_| {}), 0);
+        assert_eq!(
+            run_filtered_child(ThreadKind::Vmm, inet, |_| {}),
+            BLOCKED_SYSCALL_EXIT_CODE
+        );
+        assert_eq!(
+            run_filtered_child(ThreadKind::Vcpu, unix, |_| {}),
+            BLOCKED_SYSCALL_EXIT_CODE
+        );
     }
 }

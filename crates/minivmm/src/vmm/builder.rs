@@ -25,6 +25,8 @@ use crate::devices::virtio::VirtioDevice;
 use crate::devices::virtio::block::Block;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pci::{BAR_SIZE, NotifyRegistrar, VirtioPciDevice};
+use crate::devices::virtio::vsock::Vsock;
+use crate::devices::virtio::vsock::host::UnixBackend;
 use crate::exit::ExitSignal;
 use crate::kvm::irq::GsiRouter;
 use crate::kvm::vcpu::Vcpu;
@@ -36,6 +38,8 @@ use crate::sys::tap::Tap;
 
 const ACPI_PM_LEN: u64 = 6;
 const MIN_MEMORY: u64 = 64 << 20;
+const MIN_GUEST_CID: u64 = 3;
+const MAX_GUEST_CID: u64 = u32::MAX as u64 - 1;
 
 const REQUIRED_CAPS: &[Cap] = &[
     Cap::Irqchip,
@@ -70,6 +74,7 @@ pub struct Machine {
     pub pci: Shared<PciConfigIo>,
     pub block: Option<Shared<VirtioPciDevice<Block>>>,
     pub net: Option<Shared<VirtioPciDevice<Net>>>,
+    pub vsock: Option<Shared<VirtioPciDevice<Vsock>>>,
     pub vcpus: Vec<Vcpu>,
 }
 
@@ -94,6 +99,13 @@ fn validate(config: &MachineConfig, kvm: &Kvm) -> Result<()> {
         return Err(VmmError::InvalidConfig(
             "memory must be a multiple of 4 KiB and at least 64 MiB".into(),
         ));
+    }
+    if let Some(vsock) = &config.vsock
+        && !(MIN_GUEST_CID..=MAX_GUEST_CID).contains(&vsock.cid)
+    {
+        return Err(VmmError::InvalidConfig(format!(
+            "vsock guest CID must be between {MIN_GUEST_CID} and {MAX_GUEST_CID}"
+        )));
     }
     Ok(())
 }
@@ -218,6 +230,13 @@ pub fn build_machine(config: &MachineConfig, memory: GuestMemory) -> Result<Mach
         }
         None => None,
     };
+    let vsock = match &config.vsock {
+        Some(vsock) => {
+            let backend = Box::new(UnixBackend::new(&vsock.uds_path));
+            Some(wiring.attach(Vsock::new(vsock.cid, backend))?)
+        }
+        None => None,
+    };
     let pci = Arc::new(Mutex::new(pci));
     pio.insert(pci.clone(), PCI_CONFIG_PORT, PCI_CONFIG_PORT_LEN)?;
     router.lock_or_recover().commit()?;
@@ -239,6 +258,7 @@ pub fn build_machine(config: &MachineConfig, memory: GuestMemory) -> Result<Mach
         pci,
         block,
         net,
+        vsock,
         vcpus,
     })
 }

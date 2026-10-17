@@ -11,10 +11,12 @@ use minivmm::logger;
 use minivmm::snapshot::default_memory_path;
 use minivmm::vmm::{
     BootConfig, DiskConfig, MachineConfig, NetConfig, RestoreConfig, RuntimeOptions, Vmm,
+    VsockConfig,
 };
 
 const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=k panic=1";
 const DEFAULT_MAC: &str = "06:00:ac:10:00:02";
+const DEFAULT_GUEST_CID: u64 = 3;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "A small KVM-based virtual machine monitor")]
@@ -37,6 +39,10 @@ struct Cli {
     tap: Option<String>,
     #[arg(long, default_value = DEFAULT_MAC, value_parser = parse_mac_arg)]
     mac: [u8; 6],
+    #[arg(long, value_name = "PATH")]
+    vsock_uds: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_GUEST_CID, conflicts_with = "restore")]
+    vsock_cid: u64,
     #[arg(long, value_name = "PATH")]
     api: Option<PathBuf>,
     #[arg(long, value_name = "SNAPSHOT", conflicts_with = "kernel")]
@@ -85,6 +91,7 @@ fn run(cli: Cli) -> Result<ExitReason> {
                     .restore_memory
                     .unwrap_or_else(|| default_memory_path(&state)),
                 state,
+                vsock_uds: cli.vsock_uds,
             };
             Vmm::restore(&source, &options)
                 .with_context(|| format!("failed to restore {}", source.state.display()))?
@@ -98,6 +105,10 @@ fn run(cli: Cli) -> Result<ExitReason> {
                     read_only: cli.disk_read_only,
                 }),
                 net: cli.tap.map(|tap| NetConfig { tap, mac: cli.mac }),
+                vsock: cli.vsock_uds.map(|uds_path| VsockConfig {
+                    cid: cli.vsock_cid,
+                    uds_path,
+                }),
             };
             let boot = BootConfig {
                 kernel,
@@ -159,5 +170,9 @@ mod tests {
             .unwrap();
         assert_eq!(cli.mac, [2, 0, 0, 0, 0, 9]);
         assert!(Cli::try_parse_from(["minivmm", "--kernel", "k", "--cpus", "0"]).is_err());
+        let cli =
+            Cli::try_parse_from(["minivmm", "--restore", "s", "--vsock-uds", "/v.sock"]).unwrap();
+        assert_eq!(cli.vsock_uds, Some(PathBuf::from("/v.sock")));
+        assert!(Cli::try_parse_from(["minivmm", "--restore", "s", "--vsock-cid", "9"]).is_err());
     }
 }

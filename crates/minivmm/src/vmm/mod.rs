@@ -1,5 +1,6 @@
 mod builder;
 
+use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use kvm_ioctls::{Cap, VmFd};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use seccompiler::BpfProgram;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -27,7 +28,9 @@ use crate::devices::virtio::VirtioDevice;
 use crate::devices::virtio::block::Block;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pci::{VirtioPciDevice, VirtioPciState};
-use crate::event_loop::EventLoop;
+use crate::devices::virtio::vsock::Vsock;
+use crate::devices::virtio::vsock::host::{Handshake, HostListener};
+use crate::event_loop::{EventLoop, Interest};
 use crate::exit::{ExitOnPanic, ExitReason, ExitSignal};
 use crate::json::Json;
 use crate::kvm::KvmError;
@@ -92,11 +95,18 @@ pub struct NetConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VsockConfig {
+    pub cid: u64,
+    pub uds_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineConfig {
     pub cpus: u8,
     pub mem_size: u64,
     pub disk: Option<DiskConfig>,
     pub net: Option<NetConfig>,
+    pub vsock: Option<VsockConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +120,7 @@ pub struct BootConfig {
 pub struct RestoreConfig {
     pub state: PathBuf,
     pub memory: PathBuf,
+    pub vsock_uds: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -122,6 +133,7 @@ pub struct RuntimeOptions {
 enum DeviceKind {
     Block,
     Net,
+    Vsock,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,30 +143,50 @@ enum Token {
     Stdin,
     ApiListener,
     Tap,
+    VsockListener,
     Queue(DeviceKind, u16),
     ApiClient(u32),
+    VsockConnection(u32),
+    VsockHandshake(u32),
 }
 
 const QUEUE_TOKEN_BLOCK: u64 = 0x100;
 const QUEUE_TOKEN_NET: u64 = 0x200;
+const QUEUE_TOKEN_VSOCK: u64 = 0x300;
 const QUEUE_TOKEN_MASK: u64 = 0xff;
-const API_CLIENT_TOKEN: u64 = 1 << 32;
+const TOKEN_KIND_SHIFT: u32 = 32;
+const KIND_API_CLIENT: u64 = 1;
+const KIND_VSOCK_CONNECTION: u64 = 2;
+const KIND_VSOCK_HANDSHAKE: u64 = 3;
 
 impl Token {
     fn encode(self) -> u64 {
+        let with_kind = |kind: u64, id: u32| (kind << TOKEN_KIND_SHIFT) | u64::from(id);
         match self {
             Token::Exit => 0,
             Token::Signal => 1,
             Token::Stdin => 2,
             Token::ApiListener => 3,
             Token::Tap => 4,
+            Token::VsockListener => 5,
             Token::Queue(DeviceKind::Block, index) => QUEUE_TOKEN_BLOCK | u64::from(index),
             Token::Queue(DeviceKind::Net, index) => QUEUE_TOKEN_NET | u64::from(index),
-            Token::ApiClient(id) => API_CLIENT_TOKEN | u64::from(id),
+            Token::Queue(DeviceKind::Vsock, index) => QUEUE_TOKEN_VSOCK | u64::from(index),
+            Token::ApiClient(id) => with_kind(KIND_API_CLIENT, id),
+            Token::VsockConnection(id) => with_kind(KIND_VSOCK_CONNECTION, id),
+            Token::VsockHandshake(id) => with_kind(KIND_VSOCK_HANDSHAKE, id),
         }
     }
 
     fn decode(raw: u64) -> Option<Self> {
+        let id = raw as u32;
+        match raw >> TOKEN_KIND_SHIFT {
+            0 => {}
+            KIND_API_CLIENT => return Some(Token::ApiClient(id)),
+            KIND_VSOCK_CONNECTION => return Some(Token::VsockConnection(id)),
+            KIND_VSOCK_HANDSHAKE => return Some(Token::VsockHandshake(id)),
+            _ => return None,
+        }
         let queue_index = (raw & QUEUE_TOKEN_MASK) as u16;
         match raw {
             0 => Some(Token::Exit),
@@ -162,14 +194,13 @@ impl Token {
             2 => Some(Token::Stdin),
             3 => Some(Token::ApiListener),
             4 => Some(Token::Tap),
-            r if r & !QUEUE_TOKEN_MASK == QUEUE_TOKEN_BLOCK => {
-                Some(Token::Queue(DeviceKind::Block, queue_index))
-            }
-            r if r & !QUEUE_TOKEN_MASK == QUEUE_TOKEN_NET => {
-                Some(Token::Queue(DeviceKind::Net, queue_index))
-            }
-            r if r & API_CLIENT_TOKEN != 0 && r >> 33 == 0 => Some(Token::ApiClient(r as u32)),
-            _ => None,
+            5 => Some(Token::VsockListener),
+            r => match r & !QUEUE_TOKEN_MASK {
+                QUEUE_TOKEN_BLOCK => Some(Token::Queue(DeviceKind::Block, queue_index)),
+                QUEUE_TOKEN_NET => Some(Token::Queue(DeviceKind::Net, queue_index)),
+                QUEUE_TOKEN_VSOCK => Some(Token::Queue(DeviceKind::Vsock, queue_index)),
+                _ => None,
+            },
         }
     }
 }
@@ -191,6 +222,9 @@ pub struct Vmm {
     pci: Shared<PciConfigIo>,
     block: Option<Shared<VirtioPciDevice<Block>>>,
     net: Option<Shared<VirtioPciDevice<Net>>>,
+    vsock: Option<Shared<VirtioPciDevice<Vsock>>>,
+    vsock_listener: Option<HostListener>,
+    vsock_registered: BTreeMap<u32, (RawFd, Interest)>,
     vcpus: Vec<VcpuHandle>,
     responses: Receiver<(u8, u64, VcpuResponse)>,
     request_sequence: u64,
@@ -246,7 +280,10 @@ impl Vmm {
         if snapshot.vcpus.len() != usize::from(snapshot.config.cpus) {
             return Err(SnapshotError::Corrupt("vCPU count mismatch".into()).into());
         }
-        let config = snapshot.config.clone();
+        let mut config = snapshot.config.clone();
+        if let (Some(vsock), Some(path)) = (&mut config.vsock, &source.vsock_uds) {
+            vsock.uds_path = path.clone();
+        }
         let memory = map_memory(&source.memory, &ram_layout(config.mem_size))?;
         let machine = build_machine(&config, memory)?;
         restore_vm_state(&machine.vm, &snapshot.vm)?;
@@ -259,6 +296,7 @@ impl Vmm {
         }
         restore_virtio(&machine.block, snapshot.block, &machine.mmio)?;
         restore_virtio(&machine.net, snapshot.net, &machine.mmio)?;
+        restore_virtio(&machine.vsock, snapshot.vsock, &machine.mmio)?;
         for (vcpu, state) in machine.vcpus.iter().zip(&snapshot.vcpus) {
             vcpu.restore_state(state)?;
         }
@@ -283,6 +321,19 @@ impl Vmm {
         event_loop.add(io::stdin().as_raw_fd(), Token::Stdin.encode())?;
         register_queues(&event_loop, &machine.block, DeviceKind::Block)?;
         register_queues(&event_loop, &machine.net, DeviceKind::Net)?;
+        register_queues(&event_loop, &machine.vsock, DeviceKind::Vsock)?;
+        let vsock_listener = match &config.vsock {
+            Some(vsock) => {
+                let listener =
+                    HostListener::bind(&vsock.uds_path).map_err(|source| VmmError::OpenDevice {
+                        what: format!("vsock socket {}", vsock.uds_path.display()),
+                        source,
+                    })?;
+                event_loop.add(listener.listener_fd(), Token::VsockListener.encode())?;
+                Some(listener)
+            }
+            None => None,
+        };
         let api = match &options.api_socket {
             Some(path) => {
                 let server = ApiServer::bind(path).map_err(|source| VmmError::OpenDevice {
@@ -326,6 +377,9 @@ impl Vmm {
             pci: machine.pci,
             block: machine.block,
             net: machine.net,
+            vsock: machine.vsock,
+            vsock_listener,
+            vsock_registered: BTreeMap::new(),
             vcpus,
             responses,
             request_sequence: 0,
@@ -352,6 +406,9 @@ impl Vmm {
         }
         if let Some(net) = &self.net {
             kick(net.lock_or_recover().notify_events());
+        }
+        if let Some(vsock) = &self.vsock {
+            kick(vsock.lock_or_recover().notify_events());
         }
     }
 
@@ -412,12 +469,25 @@ impl Vmm {
             }
             Token::Queue(kind, index) => {
                 self.process_queue(kind, usize::from(index));
-                if kind == DeviceKind::Net {
-                    self.sync_tap()?;
+                match kind {
+                    DeviceKind::Net => self.sync_tap()?,
+                    DeviceKind::Vsock => self.sync_vsock(),
+                    DeviceKind::Block => {}
                 }
             }
             Token::ApiListener => self.accept_api_clients()?,
             Token::ApiClient(id) => self.handle_api_client(id)?,
+            Token::VsockListener => self.accept_vsock_handshakes()?,
+            Token::VsockHandshake(id) => self.handle_vsock_handshake(id),
+            Token::VsockConnection(id) => {
+                if let Some(vsock) = &self.vsock {
+                    vsock.lock_or_recover().process(|device, memory, queues| {
+                        device.host_ready(id);
+                        device.fill_rx(memory, queues)
+                    });
+                }
+                self.sync_vsock();
+            }
         }
         Ok(())
     }
@@ -435,6 +505,97 @@ impl Vmm {
         match kind {
             DeviceKind::Block => run(&self.block, index),
             DeviceKind::Net => run(&self.net, index),
+            DeviceKind::Vsock => run(&self.vsock, index),
+        }
+    }
+
+    fn accept_vsock_handshakes(&mut self) -> Result<()> {
+        let Some(listener) = &mut self.vsock_listener else {
+            return Ok(());
+        };
+        for (id, fd) in listener.accept() {
+            self.event_loop
+                .add(fd, Token::VsockHandshake(id).encode())?;
+        }
+        Ok(())
+    }
+
+    fn handle_vsock_handshake(&mut self, id: u32) {
+        let Some(listener) = &mut self.vsock_listener else {
+            return;
+        };
+        let fd = listener.handshake_fd(id);
+        let outcome = listener.read(id);
+        if matches!(outcome, Handshake::Pending) {
+            return;
+        }
+        if let Some(fd) = fd {
+            let _ = self.event_loop.remove(fd);
+        }
+        let Handshake::Connect {
+            stream,
+            port,
+            early_data,
+        } = outcome
+        else {
+            return;
+        };
+        let Some(vsock) = &self.vsock else {
+            return;
+        };
+        let mut device = vsock.lock_or_recover();
+        if !device.is_active() {
+            debug!("refusing a vsock connection before the guest driver is ready");
+            return;
+        }
+        device.process(|device, memory, queues| {
+            if !device.connect_from_host(Box::new(stream), port, early_data) {
+                debug!("refusing a vsock connection: too many connections");
+            }
+            device.fill_rx(memory, queues)
+        });
+        drop(device);
+        self.sync_vsock();
+    }
+
+    /// Brings epoll in line with what each vsock connection is waiting for. Stale entries are
+    /// removed before new ones are added because a closed connection's descriptor number may
+    /// already belong to a new connection.
+    fn sync_vsock(&mut self) {
+        let Some(vsock) = &self.vsock else {
+            return;
+        };
+        let wanted: BTreeMap<u32, (RawFd, Interest)> = vsock
+            .lock_or_recover()
+            .device()
+            .interests()
+            .into_iter()
+            .filter_map(|i| Interest::new(i.read, i.write).map(|interest| (i.id, (i.fd, interest))))
+            .collect();
+        let stale: Vec<u32> = self
+            .vsock_registered
+            .iter()
+            .filter(|(id, (fd, _))| wanted.get(id).is_none_or(|(new_fd, _)| new_fd != fd))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some((fd, _)) = self.vsock_registered.remove(&id) {
+                let _ = self.event_loop.remove(fd);
+            }
+        }
+        for (id, (fd, interest)) in wanted {
+            let token = Token::VsockConnection(id).encode();
+            let result = match self.vsock_registered.get(&id) {
+                Some((_, current)) if *current == interest => Ok(()),
+                Some(_) => self.event_loop.modify(fd, token, interest),
+                None => self.event_loop.add_with(fd, token, interest),
+            };
+            match result {
+                Ok(()) => {
+                    self.vsock_registered.insert(id, (fd, interest));
+                }
+                Err(err) => warn!("cannot watch vsock connection {id}: {err}"),
+            }
         }
     }
 
@@ -627,6 +788,7 @@ impl Vmm {
             pci: self.pci.lock_or_recover().state(),
             block: self.block.as_ref().map(|d| d.lock_or_recover().state()),
             net: self.net.as_ref().map(|d| d.lock_or_recover().state()),
+            vsock: self.vsock.as_ref().map(|d| d.lock_or_recover().state()),
         };
         write_snapshot(state, memory, &snapshot, &self.memory)?;
         Ok(())
@@ -756,12 +918,18 @@ mod tests {
             Token::Tap,
             Token::Queue(DeviceKind::Block, 0),
             Token::Queue(DeviceKind::Net, 1),
+            Token::Queue(DeviceKind::Vsock, 2),
+            Token::VsockListener,
             Token::ApiClient(0),
             Token::ApiClient(u32::MAX),
+            Token::VsockConnection(7),
+            Token::VsockHandshake(u32::MAX),
         ] {
             assert_eq!(Token::decode(token.encode()), Some(token));
         }
         assert_eq!(Token::decode(99), None);
+        assert_eq!(Token::decode(0x400), None);
+        assert_eq!(Token::decode(4 << 32), None);
         assert_eq!(Token::decode(u64::MAX), None);
     }
 

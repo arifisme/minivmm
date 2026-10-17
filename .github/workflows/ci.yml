@@ -36,7 +36,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: guest/out
-          key: guest-${{ hashFiles('scripts/build-guest.sh', 'guest/kernel.config', 'guest/rcS', 'guest/inittab', 'guest/initramfs-init') }}
+          key: guest-${{ hashFiles('scripts/build-guest.sh', 'guest/kernel.config', 'guest/rcS', 'guest/inittab', 'guest/initramfs-init', 'guest/vsock-test.c') }}
 
       - name: Build guest artifacts
         if: steps.guest-cache.outputs.cache-hit != 'true'
