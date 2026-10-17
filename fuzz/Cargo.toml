@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-minivmm = { path = ".." }
+minivmm = { path = "../crates/minivmm" }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 vmm-sys-util = "0.15"
 

@@ -1,0 +1,22 @@
+[package]
+name = "minivmm"
+version = "0.1.0"
+edition = "2024"
+description = "A small KVM-based virtual machine monitor"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+kvm-bindings = { version = "0.14", features = ["fam-wrappers", "serde"] }
+kvm-ioctls = "0.25"
+libc = "0.2"
+log = { version = "0.4", features = ["std"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+seccompiler = "0.5"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+vmm-sys-util = "0.15"
+
+[dev-dependencies]
+proptest = "1"

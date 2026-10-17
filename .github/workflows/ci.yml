@@ -56,7 +56,7 @@ jobs:
       - name: Format and lint
         run: |
           cargo fmt --check
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
         run: |

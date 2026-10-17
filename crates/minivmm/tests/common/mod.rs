@@ -15,7 +15,7 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 pub fn guest_dir() -> PathBuf {
     std::env::var_os("MINIVMM_GUEST_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("guest/out"))
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guest/out"))
 }
 
 pub fn artifact(name: &str) -> PathBuf {
