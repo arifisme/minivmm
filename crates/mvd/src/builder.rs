@@ -369,30 +369,25 @@ impl Builder {
         let load = Request::Load {
             function: build.setup.clone(),
         };
-        expect(
-            &mut agent,
-            &load,
-            build.code,
-            LOAD_TIMEOUT,
-            &mut on_log,
-            |reply| matches!(reply, Reply::Loaded { .. }).then_some(0.0),
-        )
-        .await?;
+        match call(&mut agent, &load, build.code, LOAD_TIMEOUT, &mut on_log).await? {
+            Reply::Loaded { .. } => {}
+            other => return Err(unexpected(other)),
+        }
         let init = Request::Init {
             timeout_ms: self.init_timeout.as_millis() as u64,
         };
-        let duration_ms = expect(
+        let duration_ms = match call(
             &mut agent,
             &init,
             &[],
             self.init_timeout + INIT_GRACE,
             &mut on_log,
-            |reply| match reply {
-                Reply::Initialized { duration_ms } => Some(*duration_ms),
-                _ => None,
-            },
         )
-        .await?;
+        .await?
+        {
+            Reply::Initialized { duration_ms } => duration_ms,
+            other => return Err(unexpected(other)),
+        };
         drop(agent);
         snapshot(process).await?;
         let files = collect(process, build.out_dir)?;
@@ -418,23 +413,23 @@ pub fn restore_args(jail: &crate::jail::JailDir, binds: &[Bind; 3]) -> Vec<Strin
     ]
 }
 
-async fn expect(
+fn unexpected(reply: Reply) -> BuildError {
+    BuildError::platform(format!("unexpected agent reply {reply:?}"))
+}
+
+async fn call(
     agent: &mut AgentClient,
     request: &Request,
     payload: &[u8],
     timeout: Duration,
     on_log: &mut (dyn FnMut(LogLine) + Send),
-    accept: impl Fn(&Reply) -> Option<f64>,
-) -> Result<f64, BuildError> {
+) -> Result<Reply, BuildError> {
     let (reply, _) = agent
         .call(request, payload, timeout, on_log)
         .await
         .map_err(|e| BuildError::platform(e.to_string()))?;
-    if let Some(value) = accept(&reply) {
-        return Ok(value);
-    }
-    Err(match reply {
-        Reply::Failed { kind, message } => BuildError {
+    match reply {
+        Reply::Failed { kind, message } => Err(BuildError {
             kind: match kind {
                 ErrorKind::LoadFailed => BuildErrorKind::Load,
                 ErrorKind::InitFailed | ErrorKind::Timeout => BuildErrorKind::Init,
@@ -442,9 +437,9 @@ async fn expect(
             },
             message,
             logs: Vec::new(),
-        },
-        other => BuildError::platform(format!("unexpected agent reply {other:?}")),
-    })
+        }),
+        reply => Ok(reply),
+    }
 }
 
 #[cfg(test)]
