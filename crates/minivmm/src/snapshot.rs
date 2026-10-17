@@ -128,7 +128,7 @@ pub fn map_memory(path: &Path, layout: &[(GuestAddress, usize)]) -> Result<Guest
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use vmm_sys_util::tempdir::TempDir;
 
     use super::*;
@@ -138,11 +138,11 @@ mod tests {
     const MEMORY_SIZE: usize = 0x2000;
     const LAYOUT: [(GuestAddress, usize); 1] = [(GuestAddress(0), MEMORY_SIZE)];
 
-    fn snapshot_files(dir: &TempDir) -> (Vec<u8>, PathBuf) {
-        let snapshot = VmSnapshot {
+    pub(crate) fn sample(mem_size: u64) -> VmSnapshot {
+        VmSnapshot {
             config: MachineConfig {
                 cpus: 1,
-                mem_size: MEMORY_SIZE as u64,
+                mem_size,
                 disk: Some(DiskConfig {
                     path: "/nonexistent/disk.img".into(),
                     read_only: true,
@@ -160,7 +160,11 @@ mod tests {
             block: None,
             net: None,
             vsock: None,
-        };
+        }
+    }
+
+    fn snapshot_files(dir: &TempDir) -> (Vec<u8>, PathBuf) {
+        let snapshot = sample(MEMORY_SIZE as u64);
         let memory = GuestMemory::new(&LAYOUT).unwrap();
         let pattern: Vec<u8> = (0..MEMORY_SIZE).map(|i| (i * 7) as u8).collect();
         memory.write(GuestAddress(0), &pattern).unwrap();

@@ -76,6 +76,8 @@ const COMMON_SYSCALLS: &[i64] = &[
     libc::SYS_gettid,
     libc::SYS_getpid,
     libc::SYS_tgkill,
+    // musl's pthread_kill uses tkill where glibc uses tgkill.
+    libc::SYS_tkill,
     libc::SYS_exit,
     libc::SYS_exit_group,
 ];
@@ -417,5 +419,54 @@ mod tests {
             run_filtered_child(ThreadKind::Vcpu, unix, |_| {}),
             BLOCKED_SYSCALL_EXIT_CODE
         );
+    }
+
+    #[test]
+    fn snapshots_can_be_written_under_the_vmm_filter() {
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        fn write() {
+            use crate::memory::{GuestAddress, GuestMemory};
+            let Some(dir) = DIR.get() else {
+                // SAFETY: exiting the forked child.
+                unsafe { libc::_exit(4) };
+            };
+            let memory = GuestMemory::new(&[(GuestAddress(0), 0x4000)]).unwrap();
+            memory.write(GuestAddress(0x1000), b"data").unwrap();
+            let state = dir.join("vm.snap");
+            let file = std::fs::File::create(dir.join("probe"));
+            if file.is_err() {
+                // SAFETY: exiting the forked child.
+                unsafe { libc::_exit(5) };
+            }
+            let snapshot = crate::snapshot::tests::sample(0x4000);
+            let written = crate::snapshot::write_snapshot(
+                &state,
+                &crate::snapshot::default_memory_path(&state),
+                &snapshot,
+                &memory,
+            );
+            // SAFETY: exiting the forked child.
+            unsafe { libc::_exit(if written.is_ok() { 0 } else { 6 }) };
+        }
+        let dir = std::env::temp_dir().join(format!("minivmm-seccomp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        DIR.set(dir.clone()).unwrap();
+        let status = run_filtered_child(ThreadKind::Vmm, write, |_| {});
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn threads_can_be_signalled_under_both_filters() {
+        fn signal_self() {
+            // SAFETY: signal 0 only checks that the thread exists.
+            if unsafe { libc::pthread_kill(libc::pthread_self(), 0) } != 0 {
+                // SAFETY: exiting the forked child.
+                unsafe { libc::_exit(7) };
+            }
+        }
+        for kind in [ThreadKind::Vmm, ThreadKind::Vcpu] {
+            assert_eq!(run_filtered_child(kind, signal_self, |_| {}), 0);
+        }
     }
 }

@@ -22,6 +22,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal -c clippy,rustfmt
           rustup default stable
+          rustup target add x86_64-unknown-linux-musl
           sudo apt-get update -q
           sudo apt-get install -y -q flex bison bc libelf-dev libssl-dev e2fsprogs cpio
 
@@ -62,6 +63,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --release --no-fail-fast -- --nocapture --test-threads=1 2>&1 | tee target/test-output.log
+          cargo test --release -p minivmm --target x86_64-unknown-linux-musl --lib 2>&1 | tee -a target/test-output.log
 
       - name: Show guest logs
         if: always()
