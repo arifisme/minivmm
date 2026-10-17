@@ -20,7 +20,7 @@ use crate::logs::LogStore;
 use crate::metrics::Metrics;
 use crate::pool::{Busy, Lease, Pool};
 use crate::store::{CODE_FILE, FunctionRecord, Store};
-use crate::vm::{Invocation, Launcher, MicroVm, VmError, VmFailure};
+use crate::vm::{API_SOCKET, Invocation, Launcher, MicroVm, VmError, VmFailure, api_request};
 
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(10);
 const MIN_REAP_INTERVAL: Duration = Duration::from_millis(50);
@@ -631,6 +631,7 @@ impl Platform {
             .spawn(&id, target.uid, limits, &binds, |jail| {
                 restore_args(jail, &binds, "warn")
             })?;
+        tracing::debug!(vm = %id, spawn_us = started.elapsed().as_micros() as u64, "VMM spawned");
         match self
             .launcher
             .synchronize(&mut process, Instant::now() + RESTORE_TIMEOUT)
@@ -638,6 +639,11 @@ impl Platform {
         {
             Ok(agent) => {
                 let restore = started.elapsed();
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let status =
+                        api_request(&process.host_file(API_SOCKET), r#"{"cmd":"status"}"#).await;
+                    tracing::debug!(vm = %id, total_us = restore.as_micros() as u64, "VMM status after restore: {status:?}");
+                }
                 self.metrics
                     .restore
                     .with_label_values(&[config.runtime.name()])

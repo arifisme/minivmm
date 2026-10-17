@@ -119,21 +119,20 @@ fn available_mib(daemon: &Daemon) -> u64 {
 fn density(daemon: &Arc<Daemon>, function: &str, memory_mib: u64) {
     let before = available_mib(daemon);
     let started = Instant::now();
-    let waves = DENSITY_VMS / 50;
-    for _ in 0..waves {
-        let handles: Vec<_> = (0..50)
-            .map(|_| {
-                let daemon = daemon.clone();
-                let function = function.to_string();
-                thread::spawn(move || {
-                    daemon.invoke(&function, json!({"action": "sleep", "ms": 3000}))
-                })
+    let handles: Vec<_> = (0..DENSITY_VMS)
+        .map(|i| {
+            let daemon = daemon.clone();
+            let function = function.to_string();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20 * i as u64));
+                let hold = 20 * (DENSITY_VMS - i) as u64 + 2000;
+                daemon.invoke(&function, json!({"action": "sleep", "ms": hold}))
             })
-            .collect();
-        for handle in handles {
-            let reply = handle.join().unwrap();
-            assert_eq!(reply.status, 200, "{}", reply.body);
-        }
+        })
+        .collect();
+    for handle in handles {
+        let reply = handle.join().unwrap();
+        assert_eq!(reply.status, 200, "{}", reply.body);
     }
     let vms = daemon.vms(function);
     let count = vms.len();

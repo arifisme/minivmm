@@ -208,7 +208,9 @@ jobs:
 
       - name: Benchmark summary
         if: always()
-        run: grep -a 'BENCH' target/benchmark-output.log || true
+        run: |
+          sudo grep -ahE 'VMM spawned|agent synchronized|VMM status after restore' target/tmp/mvd-logs/bench.log | tail -n 9 || true
+          grep -a 'BENCH' target/benchmark-output.log || true
 
       - name: Remove root-owned test state
         if: always()

@@ -23,8 +23,11 @@ pub const API_SOCKET: &str = "api.sock";
 const CONSOLE_LINES: usize = 64;
 const CONSOLE_LINE_BYTES: usize = 512;
 const KILL_WAIT: Duration = Duration::from_secs(5);
-const SYNC_TIMEOUT: Duration = Duration::from_secs(3);
-const SYNC_ATTEMPTS: u32 = 3;
+const SYNC_TIMEOUTS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+];
 const EXIT_NOTICE: Duration = Duration::from_millis(200);
 const CONSOLE_DRAIN: Duration = Duration::from_millis(20);
 const API_TIMEOUT: Duration = Duration::from_secs(120);
@@ -411,27 +414,32 @@ impl Launcher {
         }
     }
 
-    /// Connects to a restored guest and gives it fresh entropy and the current time. A guest
-    /// still processing the vsock transport reset can drop the first connection, so a
-    /// disconnect is retried on a new one.
+    /// Connects to a restored guest and gives it fresh entropy and the current time. The
+    /// guest handles the vsock transport reset sent at restore on a workqueue that can run
+    /// alongside the new connection; if it lands after the guest received the request, the
+    /// guest drops the socket without telling the host. A disconnect or a short timeout is
+    /// therefore retried on a new connection.
     pub async fn synchronize(
         &self,
         process: &mut VmmProcess,
         deadline: Instant,
     ) -> Result<AgentClient, VmError> {
         let mut last = None;
-        for _ in 0..SYNC_ATTEMPTS {
+        for timeout in SYNC_TIMEOUTS {
             let mut agent = self.connect(process, deadline).await?;
             let request = Request::Sync {
                 realtime_ns: realtime_ns(),
             };
             match agent
-                .call(&request, &host_entropy(), SYNC_TIMEOUT, &mut |_| {})
+                .call(&request, &host_entropy(), timeout, &mut |_| {})
                 .await
             {
                 Ok((Reply::Synced { .. }, _)) => return Ok(agent),
                 Ok((other, _)) => return Err(VmError::Unexpected(format!("{other:?}"))),
-                Err(err) if err.is_disconnect() => last = Some(err),
+                Err(err) if err.is_disconnect() || matches!(err, AgentError::Timeout(_)) => {
+                    tracing::debug!(vm = process.id(), "retrying agent sync: {err}");
+                    last = Some(err);
+                }
                 Err(err) => return Err(err.into()),
             }
         }
