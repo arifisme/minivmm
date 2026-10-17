@@ -7,6 +7,7 @@ use std::io;
 use std::os::fd::RawFd;
 
 use log::debug;
+use serde::{Deserialize, Serialize};
 
 use super::queue::{ChainCursor, DescriptorChain, Queue, QueueError};
 use super::{QueueMask, TYPE_VSOCK, VirtioDevice, queue_bit, read_config_bytes};
@@ -26,6 +27,14 @@ const EVENT_TRANSPORT_RESET: u32 = 0;
 
 pub trait VsockBackend: Send {
     fn connect(&mut self, port: u32) -> io::Result<Box<dyn VsockStream>>;
+}
+
+/// Host ports keep counting up across snapshots: a restored guest may still hold sockets that
+/// are closing towards ports used before the snapshot, and reusing one would get the new
+/// connection reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VsockState {
+    pub next_local_port: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -507,7 +516,7 @@ impl Vsock {
 }
 
 impl VirtioDevice for Vsock {
-    type State = ();
+    type State = VsockState;
 
     fn device_type(&self) -> u32 {
         TYPE_VSOCK
@@ -554,13 +563,18 @@ impl VirtioDevice for Vsock {
         }
     }
 
-    fn state(&self) {}
+    fn state(&self) -> VsockState {
+        VsockState {
+            next_local_port: self.next_local_port,
+        }
+    }
 
     /// Host connections cannot be carried across a snapshot, so the guest is told to drop
     /// every connection it remembers as soon as it has an event buffer.
-    fn restore(&mut self, _: ()) {
+    fn restore(&mut self, state: VsockState) {
         self.reset();
         self.reset = TransportReset::Pending;
+        self.next_local_port = state.next_local_port.max(LOCAL_PORT_BASE);
     }
 }
 
@@ -1052,8 +1066,10 @@ mod tests {
     #[test]
     fn restore_announces_a_transport_reset_before_new_connections() {
         let mut h = Harness::new();
-        h.connect_from_host(b"");
-        h.vsock.restore(());
+        let (_, old_port) = h.connect_from_host(b"");
+        let state = h.vsock.state();
+        h.vsock = Vsock::new(GUEST_CID, Box::new(h.backend.clone()));
+        h.vsock.restore(state);
         assert!(h.vsock.connections.is_empty());
         assert_eq!(h.process(EVENT_QUEUE), 0);
         let stream = FakeStream::default();
@@ -1089,6 +1105,10 @@ mod tests {
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].0.op(), Some(Op::Request));
         assert_eq!(packets[0].0.dst_port, GUEST_PORT);
+        assert!(
+            packets[0].0.src_port > old_port,
+            "host ports are not reused"
+        );
         h.send(guest_header(Op::Response, packets[0].0.src_port, 0), &[]);
         assert!(stream.0.lock().unwrap().outgoing.starts_with(b"OK "));
         assert_eq!(h.process(EVENT_QUEUE), 0);

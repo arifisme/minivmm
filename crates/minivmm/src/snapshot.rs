@@ -10,6 +10,7 @@ use crate::devices::i8042::I8042State;
 use crate::devices::pci::root::PciRootState;
 use crate::devices::serial::SerialState;
 use crate::devices::virtio::pci::VirtioPciState;
+use crate::devices::virtio::vsock::VsockState;
 use crate::kvm::irq::RoutingState;
 use crate::kvm::vcpu::VcpuState;
 use crate::kvm::vm::VmState;
@@ -50,7 +51,7 @@ pub struct VmSnapshot {
     pub pci: PciRootState,
     pub block: Option<VirtioPciState<()>>,
     pub net: Option<VirtioPciState<()>>,
-    pub vsock: Option<VirtioPciState<()>>,
+    pub vsock: Option<VirtioPciState<VsockState>>,
 }
 
 pub fn default_memory_path(state_path: &Path) -> PathBuf {

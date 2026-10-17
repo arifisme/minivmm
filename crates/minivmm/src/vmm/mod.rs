@@ -874,9 +874,9 @@ fn register_queues<D: VirtioDevice>(
     Ok(())
 }
 
-fn restore_virtio<D: VirtioDevice<State = ()>>(
+fn restore_virtio<D: VirtioDevice>(
     device: &Option<Shared<VirtioPciDevice<D>>>,
-    state: Option<VirtioPciState<()>>,
+    state: Option<VirtioPciState<D::State>>,
     mmio: &Bus,
 ) -> Result<()> {
     match (device, state) {
