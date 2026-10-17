@@ -17,7 +17,9 @@ boot and function init.
 - **`mv-proto`**: the protocol and API types shared by all of them.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and [BENCHMARKS.md](BENCHMARKS.md) for
-measured cold starts, warm latency, throughput and density.
+measured cold starts, warm latency, throughput and density. On a 4-vCPU CI runner: VMM
+restore 1.0 to 1.5 ms, cold starts p50 22 ms (native) and 38 ms (python) end to end, warm
+invocations 0.3 ms, 200 idle 128 MiB VMs in about 0.75 GB.
 
 ## Repository layout
 
@@ -311,7 +313,7 @@ the guest has finished handling the reset are held until it has.
 postcard-encoded machine configuration and device state (vCPU registers, irqchips, clock,
 PCI/MSI-X, virtqueues). Guest memory is a separate sparse file, regions back to back,
 which a restore maps `MAP_PRIVATE`: clones share every page they do not write, and restoring
-a guest takes about 1.5 ms on the CI runner. A restored clone needs only the snapshot files
+a guest takes 1.0 to 1.5 ms on the CI runner. A restored clone needs only the snapshot files
 and, if configured, the (read-only) disk image; no network device is needed.
 
 **Security.** The VMM thread and each vCPU thread install their own seccomp filter (ioctls
