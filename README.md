@@ -1,219 +1,338 @@
 # minivmm
 
-minivmm is a small virtual machine monitor for x86_64 Linux hosts, in the spirit of
-Firecracker. KVM does the CPU virtualization; everything else is implemented here:
-guest memory, the Linux boot protocol, page tables and GDT, ACPI tables, a 16550A UART,
-an i8042 stub, a PCI bus, virtio 1.x over modern PCI with MSI-X, virtio-blk, virtio-net
-on a TAP device, an epoll event loop, a JSON control socket, and snapshot/restore.
+A Lambda-style serverless platform built on a small KVM virtual machine monitor written from
+scratch in Rust. Users deploy functions (static Linux binaries or Python modules) and invoke
+them over HTTP. Every invocation runs in its own microVM, restored copy-on-write from a
+snapshot taken after the function finished initializing, so a cold start skips both kernel
+boot and function init.
 
-It boots an unmodified `bzImage` with multiple vCPUs, mounts an ext4 root from the
-virtio disk, brings up networking, and can snapshot a running guest and resume it in a
-fresh process.
+- **`minivmm`**: the VMM. KVM, virtio-blk, virtio-net and virtio-vsock over modern PCI,
+  snapshot/restore with copy-on-write memory, per-thread seccomp filters.
+- **`mvd`**: the platform daemon. HTTP API, per-function warm pools, scale-out and scale to
+  zero, admission control, two-level snapshots, a jail per VMM (mount namespace, cgroup v2,
+  unprivileged uid), persistence, Prometheus metrics and structured logs.
+- **`mv-agent`**: the guest agent, a static musl binary that runs as PID 1 inside each VM and
+  talks to the host only over vsock.
+- **`mvctl`**: the CLI, including a load generator.
+- **`mv-proto`**: the protocol and API types shared by all of them.
 
-## Host requirements
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and [BENCHMARKS.md](BENCHMARKS.md) for
+measured cold starts, warm latency, throughput and density.
 
-- x86_64 Linux with KVM and read/write access to `/dev/kvm`. The VMM checks for the
-  capabilities it needs (in-kernel irqchip, PIT, irqfd, ioeventfd, GSI routing, XSAVE,
-  vCPU events, immediate exit, ...) and refuses to start without them.
-- Rust stable with edition 2024 support (1.85 or newer).
-- For networking: a TAP interface the user may open (`scripts/setup-tap.sh`, run as
-  root, creates one owned by a chosen user).
-- For building guest artifacts: `git`, `gcc`, `make`, `flex`, `bison`, `bc`,
-  `libelf-dev`, `libssl-dev`, `cpio`, `e2fsprogs` and `apt-get` (for Ubuntu's
-  `busybox-static` package).
+## Repository layout
 
-## Building
-
-```
-cargo build --release
-scripts/build-guest.sh          # guest/out/{bzImage,initramfs.cpio.gz,rootfs.ext4}
-sudo scripts/setup-tap.sh tap0 "$USER"
-```
-
-`build-guest.sh` clones Linux v6.12 from the GitHub mirror, starts from `tinyconfig`
-and merges `guest/kernel.config` (only serial console, ACPI, PCI/MSI, virtio
-blk/net, ext4, IPv4, SMP and the KVM paravirt clock), then builds a busybox initramfs
-and a 64 MiB ext4 root filesystem containing busybox, a static dropbear and an init
-script (`guest/rcS`) that configures `eth0` as `172.16.0.2/24` and starts dropbear.
-Build products live in `guest/build` and `guest/out` and are ignored by git.
-
-## Running
-
-Boot the initramfs on the serial console:
-
-```
-target/release/minivmm --kernel guest/out/bzImage --initrd guest/out/initramfs.cpio.gz \
-    --cpus 2 --mem 512M
-```
-
-Boot from the ext4 disk with networking and a control socket:
-
-```
-target/release/minivmm --kernel guest/out/bzImage \
-    --cmdline "console=ttyS0 reboot=k panic=1 root=/dev/vda rw" \
-    --cpus 2 --mem 512M --disk rootfs.ext4 --tap tap0 --api /tmp/minivmm.sock
-ssh root@172.16.0.2              # empty password, served by dropbear in the guest
-```
-
-When stdin is a terminal it is switched to raw mode, so the guest console is fully
-interactive (Ctrl-C goes to the guest); the terminal is restored on exit. The VMM exits
-when the guest powers off or reboots, or on SIGINT/SIGTERM, after joining every vCPU
-thread.
-
-| Option | Meaning |
+| Path | Contents |
 |---|---|
-| `--kernel PATH` | bzImage to boot (boot protocol 2.12 or newer, 64-bit entry) |
-| `--initrd PATH` | initramfs to load |
-| `--cmdline TEXT` | kernel command line (default `console=ttyS0 reboot=k panic=1`) |
-| `--cpus N` | number of vCPUs (default 1) |
-| `--mem SIZE` | guest memory, e.g. `512M`, `4G` (default `512M`) |
-| `--disk PATH` | raw disk image exposed as virtio-blk `/dev/vda` |
-| `--disk-read-only` | expose the disk read-only (`VIRTIO_BLK_F_RO`) |
-| `--tap NAME` | TAP interface backing a virtio-net device |
-| `--mac ADDR` | guest MAC address (default `06:00:ac:10:00:02`) |
-| `--api PATH` | Unix socket for the control API |
-| `--restore PATH` | resume a snapshot instead of booting a kernel |
-| `--no-seccomp` | do not install seccomp filters |
-| `--log-level LEVEL` | `off`, `error`, `warn` (default), `info`, `debug`, `trace` |
+| `crates/minivmm` | The VMM (library, binary, integration tests) |
+| `crates/mvd` | The daemon and `mv-jailer`, unit, API, end-to-end and benchmark tests |
+| `crates/mv-agent` | The guest agent and the Python bootstrap |
+| `crates/mvctl` | The CLI |
+| `crates/mv-proto` | Host-agent frames, the function line protocol, HTTP API types |
+| `examples/native`, `examples/python` | Example functions (also used by the tests) |
+| `guest/` | Guest kernel config, test rootfs files, the vsock test program |
+| `scripts/` | `build-guest.sh` (kernel, test images), `build-runtimes.sh` (runtime images), `setup-tap.sh` |
+| `deploy/` | Terraform for a GCP host with nested virtualization |
+| `fuzz/` | cargo-fuzz targets |
 
-### Control API
+## Requirements
 
-The API socket speaks one JSON object per line and answers with one JSON line:
+- x86_64 Linux with KVM (`/dev/kvm`), cgroup v2 with the `cpu`, `memory` and `pids`
+  controllers, and root for `mvd` (it creates jails, device nodes and cgroups).
+- Rust stable (edition 2024) with the `x86_64-unknown-linux-musl` target.
+- For building images: `gcc`, `make`, `flex`, `bison`, `bc`, `libelf-dev`, `libssl-dev`,
+  `cpio`, `e2fsprogs`, `debootstrap`, `apt-get` and network access to GitHub and an Ubuntu
+  mirror.
+
+## Quick start
 
 ```
-$ echo '{"cmd":"status"}' | socat - UNIX-CONNECT:/tmp/minivmm.sock
-{"memory_mib":512,"ok":true,"state":"running","vcpus":2}
+# Guest kernel (Linux 6.12, tiny config) and the VMM's own test images
+scripts/build-guest.sh
+
+# Static binaries for the jail and the guest
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl -p minivmm -p mv-agent -p mv-example-native
+cargo build --release -p mvd -p mvctl
+
+# Runtime root filesystems: guest/out/runtimes/{native,python}.ext4
+sudo AGENT=target/x86_64-unknown-linux-musl/release/mv-agent scripts/build-runtimes.sh
+
+# Start the daemon (as root)
+sudo target/release/mvd \
+    --data-dir /var/lib/mvd \
+    --kernel guest/out/bzImage \
+    --runtime-dir guest/out/runtimes \
+    --vmm target/x86_64-unknown-linux-musl/release/minivmm
 ```
 
-| Request | Effect |
+In another terminal:
+
+```
+$ target/release/mvctl deploy hello examples/python --runtime python
+deploying hello (1009 bytes of code)...
+deployed hello revision 1 (init 31.2 ms)
+
+$ target/release/mvctl invoke hello --data '{"action":"echo","name":"ada"}' --verbose
+request 1c4e...  start cold  duration 21.437 ms  function 0.412 ms  restore 18.201 ms  vm hello-3
+{
+  "echo": { "action": "echo", "name": "ada" },
+  "invocations": 1,
+  ...
+}
+
+$ target/release/mvctl deploy echo target/x86_64-unknown-linux-musl/release/bootstrap --runtime native
+$ target/release/mvctl bench echo --requests 2000 --concurrency 8
+```
+
+The first deploy for a given runtime, memory size and vCPU count also builds the runtime's
+base snapshot (one boot, about a second); later deploys reuse it.
+
+## Writing functions
+
+**Native.** The handler is a static Linux executable in the archive (default name
+`bootstrap`). It speaks JSON lines on stdin/stdout:
+
+1. After its own initialization it prints `{"ready":true}`.
+2. For every request it reads one line,
+   `{"request_id":"...","deadline_ms":1760000000000,"reseed":false,"event":<event>}`,
+   and prints one line: `{"response":<json>}` or
+   `{"error":{"type":"...","message":"..."}}`.
+3. Anything written to stderr is captured as log lines for the current request. `reseed` is
+   true on the first request after the VM was restored; reseed any user-space RNG then.
+
+`examples/native` is a complete example in Rust.
+
+**Python.** The handler is `module.function` (default `main.handler`), called as
+`handler(event, context)` with the decoded event; it returns any JSON-serializable value. The
+module is imported once during init, so module-level work is captured in the snapshot.
+`context` has `request_id`, `function_name`, `memory_limit_in_mb`, `deadline_ms` and
+`get_remaining_time_in_millis()`. `print` output goes to the function's logs; an exception
+becomes a function error with its traceback. `random` is reseeded after every restore.
+
+Functions run as root inside their own VM, with the code unpacked in `/run/mv/function` (a
+tmpfs), the runtime image mounted read-only, writable `/tmp`, and no network.
+
+## CLI
+
+```
+mvctl [--url URL] [--token TOKEN] <command>      # or MVD_URL / MVD_API_TOKEN
+
+deploy NAME PATH --runtime native|python [--handler H] [--memory MIB] [--vcpus N]
+                 [--timeout 3s] [--env KEY=VALUE]... [--max-concurrency N]
+invoke NAME [--data JSON | --file PATH|-] [--verbose]
+logs NAME [--limit N] [--request-id ID] [--follow]
+list
+describe NAME
+delete NAME
+status
+bench NAME [--requests N] [--concurrency C] [--data JSON] [--json]
+```
+
+`PATH` may be a directory (packed as tar.gz), a `.tar`/`.tar.gz`/`.tgz` archive, or a single
+file (packed under the handler name). Errors print the server's message, its error kind and,
+for failed deploys, the init logs.
+
+## HTTP API
+
+All endpoints except `/healthz` require `Authorization: Bearer <token>` when `mvd` runs with
+`--api-token` (or `MVD_API_TOKEN`). Errors are JSON:
+`{"error":"message","kind":"not_found","logs":[...]}`.
+
+| Method and path | Description |
 |---|---|
-| `{"cmd":"status"}` | report `running`, `paused` or `stopping` |
-| `{"cmd":"pause"}` | stop all vCPUs |
-| `{"cmd":"resume"}` | restart all vCPUs |
-| `{"cmd":"snapshot","path":"/tmp/vm.snap"}` | write a snapshot (pausing briefly if running) |
-| `{"cmd":"shutdown"}` | stop the VM and exit |
+| `PUT /v1/functions/{name}` | Deploy or update. `multipart/form-data` with a `config` field (JSON, below) and a `code` field (tar or tar.gz). Builds the function snapshot; `201` with the function, `422` (`init_failed`, `load_failed`) with init logs, `400` for invalid input |
+| `GET /v1/functions` | List functions with their pool sizes |
+| `GET /v1/functions/{name}` | Describe a function |
+| `DELETE /v1/functions/{name}` | Delete it and stop its VMs (`204`) |
+| `GET /v1/functions/{name}/logs?limit=100&request_id=...` | Recent log lines (function stdout/stderr, init output, platform events) |
+| `POST /v1/functions/{name}/invoke` | Synchronous invocation; the body is the event (JSON, up to 6 MiB) |
+| `GET /v1/status` | Version, uptime, VM counts and host capacity |
+| `GET /v1/vms` | Live VMs: function, state, pid, uid, cgroup, jail, invocations, memory (RSS, PSS, cgroup) |
+| `GET /metrics` | Prometheus metrics |
+| `GET /healthz` | Liveness |
 
-Errors are reported as `{"ok":false,"error":"..."}`.
+Deploy configuration (all fields but `runtime` optional):
 
-### Snapshot and restore
-
-```
-echo '{"cmd":"snapshot","path":"/tmp/vm.snap"}' | socat - UNIX-CONNECT:/tmp/minivmm.sock
-echo '{"cmd":"shutdown"}' | socat - UNIX-CONNECT:/tmp/minivmm.sock
-target/release/minivmm --restore /tmp/vm.snap --api /tmp/minivmm.sock
-```
-
-The snapshot records the machine configuration (vCPU count, memory size, disk path and
-mode, TAP name and MAC), so a restore needs only the snapshot file; the disk image and
-TAP device must still exist and the disk must not have been modified in between.
-
-## Architecture
-
-```
-            main thread (epoll)                         vCPU threads (one per vCPU)
- stdin ─────► serial input        signalfd ─► exit        KVM_RUN loop
- TAP fd ────► virtio-net rx        exit eventfd           ├─ port I/O ─► PIO bus
- ioeventfd ─► virtio queue work    API socket + clients   └─ MMIO ────► MMIO bus
-                    │                                              │
-                    └──── irqfd (MSI-X GSI routes, serial GSI 4) ◄─┘
+```json
+{
+  "runtime": "python",
+  "handler": "main.handler",
+  "memory_mib": 128,
+  "vcpus": 1,
+  "timeout_ms": 3000,
+  "env": {"KEY": "value"},
+  "max_concurrency": 10
+}
 ```
 
-- **Threads.** The main thread owns the event loop: guest console input, the
-  signalfd for SIGINT/SIGTERM, the exit eventfd, one ioeventfd per virtqueue, the TAP
-  descriptor and the API sockets. Device emulation for virtqueues runs there. Each vCPU
-  runs `KVM_RUN` on its own thread and dispatches port I/O and MMIO exits to the buses.
-  Pause, resume, state capture and stop are requests sent over a channel; a real-time
-  signal kicks the vCPU out of `KVM_RUN` by setting `immediate_exit` from the signal
-  handler, so no request can be missed. Pausing first re-enters `KVM_RUN` with
-  `immediate_exit` set so pending I/O completes before state is read.
-- **Memory.** Guest RAM is anonymous `mmap` memory registered as KVM memory slots. Above
-  3 GiB the RAM continues at 4 GiB, leaving `0xC0000000-0xFFFFFFFF` for PCI BARs, the
-  IOAPIC, the LAPIC and KVM's TSS/identity map pages. Every guest access goes through
-  `GuestMemory`, which bounds-checks the whole range and copies with raw pointers.
-- **Boot.** The bzImage setup header is validated (boot flag, `HdrS`, protocol 2.12+,
-  `XLF_KERNEL_64`), the protected-mode kernel is loaded at 1 MiB and entered at its
-  64-bit entry point with a zero page (setup header copy, e820 map, command line,
-  initrd placed below `initrd_addr_max`). The VMM writes a GDT with `__BOOT_CS`/
-  `__BOOT_DS` at 0x10/0x18, identity-maps 4 GiB with 2 MiB pages and sets CR0, CR3, CR4
-  and EFER for long mode.
-- **CPU setup.** CPUID comes from `KVM_GET_SUPPORTED_CPUID` with per-vCPU APIC IDs,
-  logical counts, cache sharing and extended topology (leaves 0x1, 0x4, 0xB/0x1F and the
-  AMD leaves) rewritten for one socket with N cores. Boot MSRs, the FPU control words and
-  LAPIC LINT0 (ExtINT) / LINT1 (NMI) are set on every vCPU.
-- **Firmware tables.** RSDP, XSDT, FADT (with a PM1 event/control block), FACS, a DSDT
-  with `\_S5` and the PCI root bridge (`PNP0A03` with `_CRS` windows), and a MADT that
-  lists every vCPU and the IOAPIC. Writing `SLP_TYP=S5 | SLP_EN` to the PM1 control port
-  powers the VM off; the i8042 reset command (`reboot=k`) reboots it.
-- **Devices.** A `Bus` maps address ranges to devices for port I/O and MMIO. Port I/O
-  hosts COM1 (16550A with FIFO, loopback and THRE/RDA interrupts through an irqfd on
-  GSI 4), the i8042 reset path, the ACPI PM registers and PCI configuration mechanism #1
-  at `0xCF8/0xCFC`.
-- **PCI and virtio.** Bus 0 holds a host bridge and the virtio devices. Each virtio
-  device has one 32 KiB memory BAR with the common, ISR, device and notify structures,
-  the MSI-X table and PBA, and a capability list with all five virtio PCI capabilities
-  (including the `VIRTIO_PCI_CAP_PCI_CFG` window) plus MSI-X. BAR sizing and relocation
-  are supported; relocation moves the MMIO mapping and the ioeventfds. Feature
-  negotiation requires `VIRTIO_F_VERSION_1`; the status register follows the virtio
-  state machine and a malformed queue sets `DEVICE_NEEDS_RESET`. Split virtqueues
-  validate ring placement, descriptor indices, chain length and every buffer range.
-  MSI-X vectors map to KVM GSI routes and irqfds, with per-vector and function masking
-  and pending bits.
-- **virtio-blk** supports read, write, flush and get-id, a read-only mode and up to
-  254 segments per request; I/O is done with positioned reads/writes through a bounded
-  bounce buffer. **virtio-net** exchanges frames with a TAP opened with
-  `IFF_VNET_HDR`, keeping one pending frame and pausing TAP polling while the guest
-  has no receive buffers.
-- **Snapshots.** The file is `MVMSNAP\0`, a format version, the length of a postcard
-  encoded state blob, the blob, then each guest RAM region in address order. The state
-  holds the machine configuration, PIC/IOAPIC/PIT/kvmclock state, the GSI routing
-  table, per-vCPU CPUID, registers, special registers, XSAVE, XCRs, MSRs, LAPIC, MP
-  state and pending events, the UART, i8042 and ACPI PM registers, the latched PCI
-  configuration address and host bridge config space, and, for each virtio device, PCI
-  configuration space, MSI-X table, transport registers and virtqueue indices.
-- **Seccomp.** Before entering their loops, the main thread and each vCPU thread
-  install their own BPF filter (built with seccompiler). `ioctl` is restricted to the
-  request numbers each thread type needs and `mmap`/`mprotect` cannot create executable
-  memory; any other syscall raises SIGSYS, whose handler reports the syscall number and
-  exits.
+Invocation responses carry `x-mv-request-id`, `x-mv-duration-ms` (time in mvd),
+`x-mv-function-ms` (time inside the function), `x-mv-start` (`cold` or `warm`),
+`x-mv-restore-ms` (cold starts: VMM spawn to synchronized agent) and `x-mv-vm`.
 
-Source layout: `src/memory.rs` (guest memory), `src/arch` (layout, GDT, paging,
-registers, CPUID, ACPI/AML), `src/boot` (bzImage loader, zero page), `src/kvm` (VM,
-vCPU, GSI routing), `src/devices` (bus, UART, i8042, ACPI PM, PCI, virtio),
-`src/vmm` (machine construction and the event loop), `src/api.rs`, `src/json.rs`,
-`src/snapshot.rs`, `src/seccomp.rs` and `src/sys` (signals, terminal, TAP).
+| Status | Kind | Meaning |
+|---|---|---|
+| 200 | | The function's response |
+| 500 | (header `x-mv-function-error: unhandled`) | The function returned an error; the body is `{"type","message","trace"}` |
+| 400 | `bad_request` | The event is not valid JSON |
+| 404 | `not_found` | No such function |
+| 429 | `concurrency`, `memory`, `host_memory`, `cpu` | Throttled; `Retry-After: 1` |
+| 502 | `vm_crashed`, `runtime_exited`, `agent_error`, `response_too_large`, `launch_failed` | The VM or runtime failed; only this request is affected |
+| 504 | `timeout` | The function exceeded its timeout; its VM was destroyed |
+
+### Metrics
+
+`mvd_invocations_total{function,start}`, `mvd_invocation_errors_total{function,kind}`,
+`mvd_invocation_timeouts_total{function}`, `mvd_throttled_total{function,reason}`,
+`mvd_invocation_duration_seconds{function,start}`, `mvd_cold_start_seconds{function}`,
+`mvd_restore_seconds{runtime}`, `mvd_deployments_total{result}`,
+`mvd_pool_vms{function,state}`, `mvd_host_memory_{limit,reserved,available}_bytes`,
+`mvd_host_vcpus_busy`, `mvd_host_vcpu_limit`.
+
+Logs are written with `tracing` (`--log-format json` for structured output); every
+invocation runs in a span carrying the function and request id.
+
+## Running mvd
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--listen ADDR` | `127.0.0.1:8080` | HTTP listen address |
+| `--data-dir DIR` | `/var/lib/mvd` | Metadata, code, snapshots, jails |
+| `--kernel PATH` | | Guest kernel |
+| `--runtime-dir DIR` | | `native.ext4` and `python.ext4` |
+| `--vmm PATH` | | Static `minivmm` binary |
+| `--jailer PATH` | next to `mvd` | `mv-jailer` |
+| `--cgroup-root DIR` | `/sys/fs/cgroup/mvd` | Parent cgroup for VMs |
+| `--uid-base N` | `900000` | VMMs of function *n* run as uid/gid `N + 1 + n`; builds use `N` |
+| `--idle-timeout D` | `5m` | Stop VMs idle this long (scale to zero) |
+| `--queue-timeout D` | `2s` | How long a request waits for a VM at max concurrency before 429 |
+| `--init-timeout D` | `30s` | Limit for a function's init phase during deploy |
+| `--memory-limit-mib N` | host memory minus reserve | Memory VMs may reserve |
+| `--memory-reserve-mib N` | `512` | Refuse new VMs when `MemAvailable` drops below this |
+| `--vm-overhead-mib N` | `32` | Memory charged per VM beyond guest memory |
+| `--memory-overcommit X` | `1.0` | Multiplier on the memory limit (CoW makes real usage much lower) |
+| `--vcpu-limit N` | 2 per host CPU | vCPUs that may run invocations at once |
+| `--max-code-bytes N` | 64 MiB | Largest code archive |
+| `--api-token T` | | Require a bearer token |
+| `--log-format text\|json` | `text` | Log output |
+| `--no-jail` | | Run VMMs without jail and cgroups (development only) |
+
+Function metadata (SQLite), code and snapshots live in the data directory and survive
+restarts. On SIGTERM the daemon finishes in-flight requests, stops every VM and removes its
+jails and cgroups; leftovers from a crash are cleaned up on the next start.
+
+## Deployment
+
+`deploy/` holds Terraform for a single GCP VM with nested virtualization (N2 by default),
+a dedicated network, firewall rules for the API (port 8080) and optionally SSH, and a startup
+script that builds everything from this repository and installs `mvd` as a systemd unit
+(`deploy/mvd.service`).
+
+Create `deploy/terraform.tfvars`:
+
+```hcl
+project           = "my-project"
+api_allowed_cidrs = ["203.0.113.0/24"]
+ssh_allowed_cidrs = ["203.0.113.0/24"]
+api_token         = "a-long-random-token-of-at-least-24-chars"
+```
+
+Then:
+
+```
+cd deploy
+terraform init
+terraform apply
+export MVD_URL=$(terraform output -raw api_url) MVD_API_TOKEN=a-long-random-token-of-at-least-24-chars
+mvctl status        # ready once the startup build finishes (about 15 minutes)
+```
+
+The startup script refuses to continue if `/dev/kvm` is missing. The API is plain HTTP;
+restrict `api_allowed_cidrs` or put a TLS proxy in front of it. CI checks the configuration
+with `terraform fmt -check` and `terraform validate`; it has not been applied from here.
 
 ## Testing
 
 ```
-cargo test                                   # unit and integration tests
-MINIVMM_GUEST_DIR=guest/out MINIVMM_TAP=tap0 cargo test --release -- --test-threads=1
-cargo +nightly fuzz run virtqueue            # also: virtio_devices, device_registers,
-                                             #       api_json, bzimage, snapshot_state
+cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace                       # unit, API, agent and (skipping) KVM tests
+sudo target/release/deps/platform-*          # end-to-end, needs KVM, root and the images
+sudo target/release/deps/benchmark-* --ignored --nocapture
+cd fuzz && cargo +nightly fuzz run vsock     # also: virtqueue, virtio_devices,
+                                             # device_registers, api_json, bzimage, snapshot_state
 ```
 
-Unit tests cover the boot structures and table builders, every device model, the
-virtqueue code (including property tests) and the PCI/MSI-X logic. The integration
-tests in `tests/` start the real binary and drive the guest over the serial console:
-SMP boot with distinct APIC IDs, poweroff, reboot and SIGTERM handling, memory above
-the MMIO gap, raw terminal handling, PCI enumeration with MSI-X, ext4 persistence across
-a guest reboot, the read-only disk, ping/SSH/TCP in both directions over the TAP, the
-control API, and snapshot/restore in a fresh process. They print a message and pass
-without doing anything when `/dev/kvm`, the guest artifacts or the TAP device are
-missing.
+KVM tests print a message and pass without doing anything when `/dev/kvm`, root or the
+artifacts are missing. The GitHub Actions workflow has four jobs: `test` (fmt, clippy, every
+unit test and the VMM's KVM integration tests), `platform` (builds the runtime images and
+runs the end-to-end tests and benchmarks as root on the KVM runner), `terraform` and `fuzz`.
 
-The GitHub Actions workflow enables KVM on the runner, builds (and caches) the guest
-artifacts, creates `tap0`, runs fmt, clippy and the whole test suite, and prints and
-uploads the guest console logs.
+The end-to-end suite covers both runtimes, scale-out to the concurrency limit, 429s,
+scale to zero and back, timeouts, a guest kernel panic and a function exit mid-invoke, a
+VMM killed mid-invoke, a daemon restart, isolation between two functions (uids, cgroups,
+jail contents, mounts, network namespace, file ownership), fresh entropy and correct clocks
+in sibling clones, admission control with eviction, the CLI, a short load test, and checks
+that no VM, jail or cgroup is leaked.
+
+## The VMM
+
+`minivmm` can also be used on its own. It boots an unmodified `bzImage` with multiple vCPUs
+or restores a snapshot, with a 16550A console, i8042 reset, ACPI poweroff, PCI with MSI-X,
+virtio-blk (optionally read-only), virtio-net on a TAP device and virtio-vsock.
+
+```
+target/release/minivmm --kernel guest/out/bzImage \
+    --cmdline "console=ttyS0 reboot=k panic=1 root=/dev/vda rw" \
+    --cpus 2 --mem 512M --disk guest/out/rootfs.ext4 --tap tap0 \
+    --vsock-uds /tmp/vm.vsock --api /tmp/vm.sock
+```
+
+| Option | Meaning |
+|---|---|
+| `--kernel PATH` / `--initrd PATH` / `--cmdline TEXT` | What to boot |
+| `--cpus N`, `--mem SIZE` | vCPUs (default 1) and memory (default `512M`) |
+| `--disk PATH`, `--disk-read-only` | virtio-blk `/dev/vda` |
+| `--tap NAME`, `--mac ADDR` | virtio-net on a TAP device |
+| `--vsock-uds PATH`, `--vsock-cid N` | virtio-vsock with host connections on a Unix socket (CID default 3) |
+| `--api PATH` | JSON-lines control socket |
+| `--restore STATE`, `--restore-memory PATH` | Resume a snapshot (memory defaults to `STATE.mem`); `--vsock-uds` and `--api` may differ per clone |
+| `--no-seccomp`, `--log-level LEVEL` | Debugging |
+
+**Control API** (`{"cmd":...}` per line): `status` (with `restore_us` after a restore),
+`pause`, `resume`, `snapshot` (`path`, optional `mem_path`), `shutdown`.
+
+**vsock.** A host process connects to the `--vsock-uds` socket and writes
+`CONNECT <port>\n`; the VMM answers `OK <host port>\n` once the guest accepts, then the
+socket carries the stream. Guest connections to the host (CID 2) port `P` are forwarded to
+the Unix socket `<uds>_<P>`. After a restore the guest receives a transport reset, so
+listening sockets survive and stale connections are closed.
+
+**Snapshots.** The state file holds `MVMSNAP\0`, the format version (2), and the
+postcard-encoded machine configuration and device state (vCPU registers, irqchips, clock,
+PCI/MSI-X, virtqueues). Guest memory is a separate sparse file, regions back to back,
+which a restore maps `MAP_PRIVATE`: clones share every page they do not write, and restoring
+a guest takes about 1.5 ms on the CI runner. A restored clone needs only the snapshot files
+and, if configured, the (read-only) disk image; no network device is needed.
+
+**Security.** The VMM thread and each vCPU thread install their own seccomp filter (ioctls
+restricted per thread, no executable mappings, sockets only of family `AF_UNIX`); every guest
+input (descriptors, packets, registers, snapshot state) is bounds-checked, and the device
+models, virtqueues, vsock packet handling, API parser and snapshot decoder are fuzzed.
+AUDIT.md records an adversarial review of the VMM.
 
 ## Limitations
 
-- x86_64 hosts and guests only; one socket, no SMT topology, no CPU hotplug.
-- MSI-X is the only interrupt mechanism for PCI devices; there is no INTx fallback.
-- virtio features are minimal: no indirect descriptors, event index, mergeable
-  receive buffers, checksum or segmentation offloads, multiqueue or control queue.
-- Block I/O is synchronous on the event loop thread; one disk and one NIC at most.
-- Reboot ends the VMM process instead of resetting the machine.
-- Snapshots copy all guest memory and are not incremental; restoring requires a host
-  with a compatible CPU (the saved CPUID and MSRs are replayed as-is), the same disk
-  image path and TAP name, and an unmodified disk image.
-- The control API has no authentication beyond the socket's filesystem permissions.
+- x86_64 only; guests have no network, and functions run as root inside their VM.
+- One request per VM at a time (like Lambda); no asynchronous invocation, no streaming
+  responses, events and responses up to 6 MiB.
+- The API is plain HTTP with an optional bearer token; there are no users, quotas or TLS.
+- Logs are kept in memory (2000 lines per function) and are lost on restart.
+- Snapshots replay the CPUID and MSRs of the host that built them; move the data directory
+  only between identical hosts. A runtime image change triggers a rebuild of every function
+  snapshot on startup.
+- VMs of the same function share a uid; isolation between VMs of one function relies on the
+  per-VM mount namespace, cgroup and the VMM's seccomp filter.
+- Deploys are serialized; the first deploy of a new VM shape also boots a base snapshot.
+- Admission control reserves each VM's full memory limit unless `--memory-overcommit` is
+  raised; CPU admission counts running invocations, not guest CPU use.
+- The VMM keeps the limitations listed in AUDIT.md: no INTx, minimal virtio features,
+  block I/O on the event loop thread, reboot ends the process.
