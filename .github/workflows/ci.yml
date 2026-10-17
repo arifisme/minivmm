@@ -112,9 +112,9 @@ jobs:
           free -m
           uname -r
 
-      - name: Cache guest artifacts
+      - name: Restore guest artifacts
         id: guest-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: guest/out
           key: guest-${{ hashFiles('scripts/build-guest.sh', 'guest/kernel.config', 'guest/rcS', 'guest/inittab', 'guest/initramfs-init', 'guest/vsock-test.c') }}
@@ -123,8 +123,16 @@ jobs:
         if: steps.guest-cache.outputs.cache-hit != 'true'
         run: ./scripts/build-guest.sh
 
-      - name: Cache the python base image
-        uses: actions/cache@v4
+      - name: Save guest artifacts
+        if: steps.guest-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: guest/out
+          key: ${{ steps.guest-cache.outputs.cache-primary-key }}
+
+      - name: Restore the python base image
+        id: python-cache
+        uses: actions/cache/restore@v4
         with:
           path: guest/build/runtimes/python-base.tar
           key: python-base-${{ hashFiles('scripts/build-runtimes.sh') }}
@@ -151,6 +159,13 @@ jobs:
             sudo tar -C guest/build/runtimes -cf guest/build/runtimes/python-base.tar python-base
           fi
           sudo chown -R "$USER" guest/build/runtimes/python-base.tar
+
+      - name: Save the python base image
+        if: steps.python-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: guest/build/runtimes/python-base.tar
+          key: ${{ steps.python-cache.outputs.cache-primary-key }}
 
       - name: Build platform tests
         run: |
