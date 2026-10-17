@@ -185,6 +185,12 @@ fuzz_target!(|data: &[u8]| {
                     pipe.eof = op & 0x80 != 0;
                 }
             }
+            _ if op & 0x80 != 0 => {
+                let state = device.state();
+                if device.restore(state).is_err() {
+                    return;
+                }
+            }
             _ => {
                 let interests = device.device().interests();
                 for interest in interests {
