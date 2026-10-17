@@ -425,8 +425,10 @@ impl Launcher {
         deadline: Instant,
     ) -> Result<AgentClient, VmError> {
         let mut last = None;
+        let started = Instant::now();
         for timeout in SYNC_TIMEOUTS {
             let mut agent = self.connect(process, deadline).await?;
+            let connected = started.elapsed();
             let request = Request::Sync {
                 realtime_ns: realtime_ns(),
             };
@@ -434,7 +436,15 @@ impl Launcher {
                 .call(&request, &host_entropy(), timeout, &mut |_| {})
                 .await
             {
-                Ok((Reply::Synced { .. }, _)) => return Ok(agent),
+                Ok((Reply::Synced { .. }, _)) => {
+                    tracing::debug!(
+                        vm = process.id(),
+                        connect_us = connected.as_micros() as u64,
+                        sync_us = (started.elapsed() - connected).as_micros() as u64,
+                        "agent synchronized"
+                    );
+                    return Ok(agent);
+                }
                 Ok((other, _)) => return Err(VmError::Unexpected(format!("{other:?}"))),
                 Err(err) if err.is_disconnect() || matches!(err, AgentError::Timeout(_)) => {
                     tracing::debug!(vm = process.id(), "retrying agent sync: {err}");

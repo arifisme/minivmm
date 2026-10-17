@@ -12,7 +12,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 const MAX_REPLY_HEADER: usize = 64 << 10;
 const MAX_REPLY_PAYLOAD: usize = MAX_RESPONSE_LEN + 4096;
 const MAX_HANDSHAKE_LINE: usize = 64;
-const RETRY_DELAY: Duration = Duration::from_millis(2);
+const RETRY_DELAY: Duration = Duration::from_micros(500);
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -48,11 +48,21 @@ impl AgentClient {
     /// Connects through the VMM's vsock socket, retrying until `deadline` while the VMM is
     /// still starting or the guest has not accepted yet.
     pub async fn connect(uds: &Path, port: u32, deadline: Instant) -> Result<Self, AgentError> {
+        let mut attempts = 0u32;
         loop {
+            attempts += 1;
             let remaining = deadline.saturating_duration_since(Instant::now());
+            let started = Instant::now();
             let attempt = tokio::time::timeout(remaining, Self::try_connect(uds, port)).await;
             match attempt {
-                Ok(Ok(client)) => return Ok(client),
+                Ok(Ok(client)) => {
+                    tracing::debug!(
+                        attempts,
+                        handshake_us = started.elapsed().as_micros() as u64,
+                        "connected to the agent"
+                    );
+                    return Ok(client);
+                }
                 Ok(Err(err)) if Instant::now() + RETRY_DELAY < deadline => {
                     tracing::trace!("agent not reachable yet: {err}");
                     tokio::time::sleep(RETRY_DELAY).await;
