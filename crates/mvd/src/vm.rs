@@ -11,7 +11,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::admission::MemoryReservation;
 use crate::agent::{AgentClient, AgentError, LogLine};
@@ -86,6 +86,7 @@ pub struct VmmProcess {
     id: String,
     pid: Option<u32>,
     exit: watch::Receiver<Option<String>>,
+    kill: Option<oneshot::Sender<()>>,
     console: Console,
     jail: Option<JailDir>,
     cgroup: Option<Cgroup>,
@@ -141,6 +142,7 @@ impl VmmProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn();
         let mut child = match spawned {
             Ok(child) => child,
@@ -161,14 +163,22 @@ impl VmmProcess {
         }
         let pid = child.id();
         let (sender, exit) = watch::channel(None);
+        let (kill, killed) = oneshot::channel();
         tokio::spawn(async move {
-            let status = child.wait().await;
+            let status = tokio::select! {
+                status = child.wait() => status,
+                _ = killed => {
+                    let _ = child.start_kill();
+                    child.wait().await
+                }
+            };
             let _ = sender.send(Some(describe_exit(status)));
         });
         Ok(Self {
             id,
             pid,
             exit,
+            kill: Some(kill),
             console,
             jail: Some(jail),
             cgroup,
@@ -247,15 +257,14 @@ impl VmmProcess {
             .unwrap_or_default()
     }
 
-    fn kill(&self) {
+    /// Kills through the child handle rather than by pid, so a VMM that was already reaped
+    /// cannot make the signal hit an unrelated process that reused its pid.
+    fn kill(&mut self) {
         if let Some(cgroup) = &self.cgroup {
             cgroup.kill();
         }
-        if let Some(pid) = self.pid
-            && !self.has_exited()
-        {
-            // SAFETY: signalling our own child, which has not been reaped yet.
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        if let Some(kill) = self.kill.take() {
+            let _ = kill.send(());
         }
     }
 
