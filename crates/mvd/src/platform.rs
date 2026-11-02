@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -103,6 +104,18 @@ pub struct Deployed {
     pub uid: u32,
     pub snapshot: SnapshotFiles,
     pub rootfs: PathBuf,
+    dir: PathBuf,
+    retired: AtomicBool,
+}
+
+/// A replaced revision keeps its snapshot until the last request that may still cold start
+/// from it lets go.
+impl Drop for Deployed {
+    fn drop(&mut self) {
+        if self.retired.load(Ordering::Relaxed) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
 }
 
 pub struct FunctionEntry {
@@ -219,11 +232,14 @@ impl Platform {
     }
 
     fn deployed(&self, record: FunctionRecord) -> Deployed {
+        let dir = self.store.revision_dir(record.id, record.revision);
         Deployed {
             uid: self.uid_for(record.id),
-            snapshot: SnapshotFiles::in_dir(&self.store.revision_dir(record.id, record.revision)),
+            snapshot: SnapshotFiles::in_dir(&dir),
             rootfs: self.builder.images().rootfs(record.config.runtime),
             record,
+            dir,
+            retired: AtomicBool::new(false),
         }
     }
 
@@ -236,6 +252,8 @@ impl Platform {
             let name = record.name.clone();
             match self.restore_function(record).await {
                 Ok(deployed) => {
+                    let revision = deployed.record.revision;
+                    self.remove_stale_revisions(deployed.record.id, revision..=revision);
                     let max = deployed.record.config.max_concurrency;
                     let entry = Arc::new(FunctionEntry {
                         current: RwLock::new(Arc::new(deployed)),
@@ -373,13 +391,17 @@ impl Platform {
         let revision = record.revision;
         let deployed = Arc::new(self.deployed(record));
         let max = deployed.record.config.max_concurrency;
-        let replaced = {
+        let (replaced, previous) = {
             let mut functions = self.functions.write().unwrap_or_else(|e| e.into_inner());
             match functions.get(name) {
                 Some(entry) => {
-                    *entry.current.write().unwrap_or_else(|e| e.into_inner()) = deployed;
+                    let previous = std::mem::replace(
+                        &mut *entry.current.write().unwrap_or_else(|e| e.into_inner()),
+                        deployed,
+                    );
+                    previous.retired.store(true, Ordering::Relaxed);
                     entry.pool.set_max(max);
-                    entry.pool.take_all_idle()
+                    (entry.pool.take_all_idle(), Some(previous))
                 }
                 None => {
                     functions.insert(
@@ -389,14 +411,15 @@ impl Platform {
                             pool: Pool::new(max),
                         }),
                     );
-                    Vec::new()
+                    (Vec::new(), None)
                 }
             }
         };
+        drop(previous);
         for vm in replaced {
             self.destroy_later(vm);
         }
-        self.remove_old_revisions(id, revision);
+        self.remove_stale_revisions(id, revision.saturating_sub(1)..=revision);
         self.metrics.deployments.with_label_values(&["ok"]).inc();
         let message = format!(
             "deployed revision {revision} in {} ms (init {:.1} ms)",
@@ -408,13 +431,18 @@ impl Platform {
         self.describe(name)
     }
 
-    fn remove_old_revisions(&self, id: i64, keep: u64) {
+    /// Removes revision directories left behind by failed deploys or an earlier run.
+    fn remove_stale_revisions(&self, id: i64, keep: std::ops::RangeInclusive<u64>) {
         let Ok(entries) = fs::read_dir(self.store.function_dir(id)) else {
             return;
         };
-        let current = format!("rev-{keep}");
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy() != current {
+            let name = entry.file_name();
+            let revision = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("rev-"))
+                .and_then(|n| n.parse::<u64>().ok());
+            if !revision.is_some_and(|revision| keep.contains(&revision)) {
                 let _ = fs::remove_dir_all(entry.path());
             }
         }

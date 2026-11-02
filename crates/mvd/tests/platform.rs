@@ -217,6 +217,11 @@ fn python_functions_keep_state_and_report_errors() {
         daemon.python_example(),
     );
     assert_eq!(redeployed.body["revision"], 2);
+    let revisions: Vec<String> = fs::read_dir(daemon.data_dir.join("functions/1"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(revisions, ["rev-2"], "the replaced revision is removed");
     let fresh = daemon.invoke_ok("py", json!({"action": "env"}));
     assert_eq!(fresh.header("x-mv-start").as_deref(), Some("cold"));
     assert_eq!(fresh.body["env"]["GREETING"], "hello");
