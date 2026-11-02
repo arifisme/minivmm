@@ -15,7 +15,7 @@ use mv_proto::agent::Runtime;
 use mv_proto::api::{
     DeployConfig, ErrorBody, FunctionInfo, HEADER_DURATION, HEADER_FUNCTION_DURATION,
     HEADER_REQUEST_ID, HEADER_RESTORE, HEADER_START, HEADER_VM, LogEntry, MAX_LOG_ENTRIES,
-    StatusInfo, VmInfo,
+    MAX_TIMEOUT_MS, StatusInfo, VmInfo,
 };
 use reqwest::blocking::{Client, RequestBuilder, Response, multipart};
 
@@ -114,7 +114,7 @@ impl Api {
     fn new(url: &str, token: Option<String>) -> anyhow::Result<Self> {
         Ok(Self {
             client: Client::builder()
-                .timeout(Duration::from_secs(600))
+                .timeout(Duration::from_millis(MAX_TIMEOUT_MS) + Duration::from_secs(60))
                 .build()?,
             url: url.trim_end_matches('/').to_string(),
             token,

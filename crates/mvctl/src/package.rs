@@ -41,6 +41,12 @@ fn append_dir<W: io::Write>(
     for entry in entries {
         let name = prefix.join(entry.file_name());
         let path = entry.path();
+        if entry.file_type()?.is_symlink() && path.is_dir() {
+            anyhow::bail!(
+                "{} links to a directory, which cannot be packaged",
+                path.display()
+            );
+        }
         if path.is_dir() {
             if entry.file_name() == "__pycache__" {
                 continue;
@@ -107,6 +113,10 @@ mod tests {
             .read_to_end(&mut passed)
             .unwrap();
         assert_eq!(passed, b"opaque");
+
+        std::os::unix::fs::symlink(&src, src.join("pkg/loop")).unwrap();
+        let looped = package(&src, "unused").unwrap_err().to_string();
+        assert!(looped.contains("links to a directory"), "{looped}");
         assert!(package(&dir.path().join("missing"), "x").is_err());
     }
 }
