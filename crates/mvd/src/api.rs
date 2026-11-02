@@ -13,6 +13,7 @@ use mv_proto::api::{
     HEADER_REQUEST_ID, HEADER_RESTORE, HEADER_START, HEADER_VM,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::builder::BuildErrorKind;
 use crate::platform::{InvokeReport, InvokeResult, Platform, PlatformError, Start};
@@ -63,7 +64,7 @@ async fn authorize(State(state): State<AppState>, request: Request, next: Next) 
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "));
-        if presented != Some(token) {
+        if !presented.is_some_and(|presented| same_secret(presented, token)) {
             return error(
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
@@ -73,6 +74,16 @@ async fn authorize(State(state): State<AppState>, request: Request, next: Next) 
         }
     }
     next.run(request).await
+}
+
+/// Compares digests without branching on their contents, so response times reveal nothing
+/// about how much of the token a guess got right.
+fn same_secret(presented: &str, token: &str) -> bool {
+    let (a, b) = (Sha256::digest(presented), Sha256::digest(token));
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |diff, (x, y)| diff | (x ^ y))
+        == 0
 }
 
 fn error(status: StatusCode, kind: &str, message: String, logs: Vec<String>) -> Response {
@@ -580,6 +591,8 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(send(&app, right).await.0, StatusCode::OK);
+        assert!(same_secret("s3cret", "s3cret"));
+        assert!(!same_secret("s3cre", "s3cret"));
     }
 
     #[test]
