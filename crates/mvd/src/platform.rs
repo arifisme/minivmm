@@ -787,13 +787,6 @@ impl Platform {
         }
         let target = entry.current();
         let config = &target.record.config;
-        let _cpu = self
-            .admission
-            .reserve_cpu(u32::from(config.vcpus))
-            .map_err(|_| PlatformError::Throttled {
-                reason: "cpu",
-                message: "every host CPU is busy".into(),
-            })?;
         let mut dead = Vec::new();
         let lease = entry
             .pool
@@ -812,6 +805,20 @@ impl Platform {
             },
             Busy::Closed => PlatformError::NotFound(name.to_string()),
         })?;
+        let Ok(_cpu) = self.admission.reserve_cpu(u32::from(config.vcpus)) else {
+            match lease {
+                Lease::Warm(vm) => {
+                    if let Some(vm) = entry.pool.release(vm) {
+                        self.destroy_later(vm);
+                    }
+                }
+                Lease::Cold(permit) => entry.pool.start_failed(permit),
+            }
+            return Err(PlatformError::Throttled {
+                reason: "cpu",
+                message: "every host CPU is busy".into(),
+            });
+        };
         let mut vm = match lease {
             Lease::Warm(vm) => {
                 report.start = Some(Start::Warm);
