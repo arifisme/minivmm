@@ -14,6 +14,7 @@ use mv_proto::api::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio::task::JoinError;
 
 use crate::builder::BuildErrorKind;
 use crate::platform::{InvokeReport, InvokeResult, Platform, PlatformError, Start};
@@ -174,15 +175,17 @@ async fn describe(State(state): State<AppState>, Path(name): Path<String>) -> Re
 /// slots even when the client disconnects and the handler future is dropped.
 async fn detached<T: Send + 'static>(
     work: impl Future<Output = T> + Send + 'static,
-) -> Result<T, Response> {
-    tokio::spawn(work).await.map_err(|err| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            format!("the request failed: {err}"),
-            Vec::new(),
-        )
-    })
+) -> Result<T, JoinError> {
+    tokio::spawn(work).await
+}
+
+fn task_failed(err: JoinError) -> Response {
+    error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        format!("the request failed: {err}"),
+        Vec::new(),
+    )
 }
 
 async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> Response {
@@ -190,7 +193,7 @@ async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> Resp
     match detached(async move { platform.delete(&name).await }).await {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(err)) => platform_error(err),
-        Err(response) => response,
+        Err(err) => task_failed(err),
     }
 }
 
@@ -269,7 +272,7 @@ async fn deploy(
     match detached(async move { platform.deploy(&name, config, code.to_vec()).await }).await {
         Ok(Ok(info)) => (StatusCode::CREATED, Json(info)).into_response(),
         Ok(Err(err)) => platform_error(err),
-        Err(response) => response,
+        Err(err) => task_failed(err),
     }
 }
 
@@ -327,7 +330,7 @@ async fn invoke(State(state): State<AppState>, Path(name): Path<String>, body: B
     let mut report =
         match detached(async move { platform.invoke(&name, body.to_vec()).await }).await {
             Ok(report) => report,
-            Err(response) => return response,
+            Err(err) => return task_failed(err),
         };
     let headers = invoke_headers(&report);
     let result = std::mem::replace(
