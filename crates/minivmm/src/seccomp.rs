@@ -14,6 +14,8 @@ use thiserror::Error;
 use vmm_sys_util::signal::register_signal_handler;
 use vmm_sys_util::{ioctl_io_nr, ioctl_ior_nr, ioctl_iow_nr, ioctl_iowr_nr};
 
+use crate::sys::signal::kick_signal;
+
 const KVMIO: u32 = 0xae;
 const TCGETS: u64 = 0x5401;
 const TCSETS: u64 = 0x5402;
@@ -75,9 +77,6 @@ const COMMON_SYSCALLS: &[i64] = &[
     libc::SYS_getrandom,
     libc::SYS_gettid,
     libc::SYS_getpid,
-    libc::SYS_tgkill,
-    // musl's pthread_kill uses tkill where glibc uses tgkill.
-    libc::SYS_tkill,
     libc::SYS_exit,
     libc::SYS_exit_group,
 ];
@@ -177,6 +176,18 @@ fn unix_socket_rule() -> Result<Vec<SeccompRule>, SeccompError> {
     Ok(vec![SeccompRule::new(vec![condition])?])
 }
 
+/// Threads only ever signal each other to kick a vCPU out of `KVM_RUN`, so no other signal
+/// can be sent, to this process or to another VMM running under the same uid.
+fn kick_signal_rule(signal_arg: u8) -> Result<Vec<SeccompRule>, SeccompError> {
+    let condition = SeccompCondition::new(
+        signal_arg,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Eq,
+        kick_signal() as u64,
+    )?;
+    Ok(vec![SeccompRule::new(vec![condition])?])
+}
+
 pub fn build_filter(kind: ThreadKind) -> Result<BpfProgram, SeccompError> {
     let (extra, ioctls) = match kind {
         ThreadKind::Vmm => (VMM_SYSCALLS, vmm_ioctls()),
@@ -191,6 +202,9 @@ pub fn build_filter(kind: ThreadKind) -> Result<BpfProgram, SeccompError> {
     if kind == ThreadKind::Vmm {
         rules.insert(libc::SYS_socket, unix_socket_rule()?);
     }
+    rules.insert(libc::SYS_tgkill, kick_signal_rule(2)?);
+    // musl's pthread_kill uses tkill where glibc uses tgkill.
+    rules.insert(libc::SYS_tkill, kick_signal_rule(1)?);
     rules.insert(libc::SYS_mmap, non_executable_rule()?);
     rules.insert(libc::SYS_mprotect, non_executable_rule()?);
     let filter = SeccompFilter::new(
@@ -457,16 +471,46 @@ mod tests {
     }
 
     #[test]
-    fn threads_can_be_signalled_under_both_filters() {
-        fn signal_self() {
-            // SAFETY: signal 0 only checks that the thread exists.
-            if unsafe { libc::pthread_kill(libc::pthread_self(), 0) } != 0 {
+    fn threads_can_only_send_the_kick_signal() {
+        fn kick_self() {
+            let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            // SAFETY: the kick signal is blocked first, so it stays pending instead of
+            // terminating the child.
+            let sent = unsafe {
+                libc::sigemptyset(blocked.as_mut_ptr());
+                libc::sigaddset(blocked.as_mut_ptr(), kick_signal());
+                libc::pthread_sigmask(libc::SIG_BLOCK, blocked.as_ptr(), std::ptr::null_mut());
+                libc::pthread_kill(libc::pthread_self(), kick_signal())
+            };
+            if sent != 0 {
                 // SAFETY: exiting the forked child.
                 unsafe { libc::_exit(7) };
             }
         }
+        // Raw system calls, because musl's pthread_kill blocks SIGSYS around its own.
+        fn tgkill_terminate() {
+            // SAFETY: the filter is expected to stop this before the signal is sent.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    libc::gettid(),
+                    libc::SIGTERM,
+                )
+            };
+        }
+        fn tkill_terminate() {
+            // SAFETY: as above.
+            unsafe { libc::syscall(libc::SYS_tkill, libc::gettid(), libc::SIGTERM) };
+        }
         for kind in [ThreadKind::Vmm, ThreadKind::Vcpu] {
-            assert_eq!(run_filtered_child(kind, signal_self, |_| {}), 0);
+            assert_eq!(run_filtered_child(kind, kick_self, |_| {}), 0);
+            for terminate in [tgkill_terminate, tkill_terminate] {
+                assert_eq!(
+                    run_filtered_child(kind, terminate, |_| {}),
+                    BLOCKED_SYSCALL_EXIT_CODE
+                );
+            }
         }
     }
 }
