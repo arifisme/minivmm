@@ -29,6 +29,8 @@ struct Options {
     gid: u32,
     #[arg(long, value_name = "FILE")]
     cgroup_procs: Option<PathBuf>,
+    #[arg(long, value_name = "BYTES")]
+    max_file_bytes: libc::rlim_t,
     #[arg(long, value_name = "SOURCE:TARGET", value_parser = parse_bind)]
     bind: Vec<(PathBuf, String)>,
     #[arg(long, value_name = "PATH")]
@@ -146,22 +148,34 @@ fn enter_root(root: &Path) -> io::Result<()> {
     fs::remove_dir(format!("/{OLD_ROOT}"))
 }
 
-fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
-    let open_files = libc::rlimit {
-        rlim_cur: MAX_OPEN_FILES,
-        rlim_max: MAX_OPEN_FILES,
+/// Closes every descriptor inherited from the daemon except standard input, output and error.
+fn close_inherited_fds() {
+    // SAFETY: close_range only closes descriptors, and nothing in this process uses any
+    // above standard error yet.
+    let closed = unsafe { libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0) };
+    if closed < 0 {
+        for fd in 3..MAX_OPEN_FILES as libc::c_int {
+            // SAFETY: as above, for kernels without close_range.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+fn limit(resource: libc::__rlimit_resource_t, value: libc::rlim_t) -> io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: value,
+        rlim_max: value,
     };
-    let no_core = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
+    // SAFETY: setrlimit receives a valid rlimit structure.
+    check(unsafe { libc::setrlimit(resource, &limit) }, "setrlimit")
+}
+
+fn drop_privileges(uid: u32, gid: u32, max_file_bytes: libc::rlim_t) -> io::Result<()> {
+    limit(libc::RLIMIT_NOFILE, MAX_OPEN_FILES)?;
+    limit(libc::RLIMIT_CORE, 0)?;
+    limit(libc::RLIMIT_FSIZE, max_file_bytes)?;
     // SAFETY: plain system calls with valid arguments.
     unsafe {
-        check(
-            libc::setrlimit(libc::RLIMIT_NOFILE, &open_files),
-            "setrlimit",
-        )?;
-        check(libc::setrlimit(libc::RLIMIT_CORE, &no_core), "setrlimit")?;
         check(libc::setgroups(0, std::ptr::null()), "setgroups")?;
         check(libc::setresgid(gid, gid, gid), "setresgid")?;
         check(libc::setresuid(uid, uid, uid), "setresuid")?;
@@ -187,6 +201,7 @@ fn exec(args: &[OsString]) -> io::Result<Infallible> {
 }
 
 fn run(options: Options) -> io::Result<Infallible> {
+    close_inherited_fds();
     if let Some(procs) = &options.cgroup_procs {
         fs::write(procs, "0").map_err(|e| io::Error::new(e.kind(), format!("join cgroup: {e}")))?;
     }
@@ -208,7 +223,7 @@ fn run(options: Options) -> io::Result<Infallible> {
     }
     create_kvm_node(root, options.uid, options.gid)?;
     enter_root(root)?;
-    drop_privileges(options.uid, options.gid)?;
+    drop_privileges(options.uid, options.gid, options.max_file_bytes)?;
     exec(&options.args)
 }
 
@@ -237,6 +252,8 @@ mod tests {
             "900001",
             "--gid",
             "900001",
+            "--max-file-bytes",
+            "1048576",
             "--bind",
             "/data/fn/snapshot.state:/snapshot.state",
             "--exec",

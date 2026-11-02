@@ -408,7 +408,14 @@ impl Launcher {
             _ => None,
         };
         let args = args(&jail);
-        let command = jail.command(&self.jail, uid, uid, cgroup.as_ref(), binds, &args);
+        let command = jail.command(
+            &self.jail,
+            uid,
+            cgroup.as_ref(),
+            binds,
+            &args,
+            limits.memory_bytes,
+        );
         VmmProcess::spawn(command, id.to_string(), jail, cgroup).map_err(VmError::Spawn)
     }
 

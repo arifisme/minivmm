@@ -81,14 +81,16 @@ impl JailDir {
         self.dir.join(name)
     }
 
+    /// The VMM runs with uid and gid `uid`, and cannot write files larger than
+    /// `max_file_bytes`, which is enough for a snapshot of its guest memory.
     pub fn command(
         &self,
         config: &JailConfig,
         uid: u32,
-        gid: u32,
         cgroup: Option<&Cgroup>,
         binds: &[Bind],
         vmm_args: &[String],
+        max_file_bytes: u64,
     ) -> Command {
         if !self.enabled {
             let mut command = Command::new(&config.vmm);
@@ -102,7 +104,9 @@ impl JailDir {
             .arg("--uid")
             .arg(uid.to_string())
             .arg("--gid")
-            .arg(gid.to_string())
+            .arg(uid.to_string())
+            .arg("--max-file-bytes")
+            .arg(max_file_bytes.to_string())
             .arg("--exec")
             .arg(&config.vmm);
         if let Some(cgroup) = cgroup {
@@ -211,10 +215,10 @@ mod tests {
         let command = jail.command(
             &config,
             7,
-            8,
             None,
             &[rootfs],
             &["--restore".into(), "/s".into()],
+            1 << 30,
         );
         assert_eq!(command.as_std().get_program(), "/usr/bin/mv-jailer");
         let args = args(&command);
@@ -222,6 +226,11 @@ mod tests {
         assert_eq!(args[bind + 1], "/images/python.ext4:/rootfs.ext4");
         assert_eq!(&args[args.len() - 3..], &["--", "--restore", "/s"]);
         assert!(args.windows(2).any(|w| w == ["--uid", "7"]));
+        assert!(args.windows(2).any(|w| w == ["--gid", "7"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--max-file-bytes", "1073741824"])
+        );
     }
 
     #[test]
@@ -233,7 +242,7 @@ mod tests {
         let rootfs = Bind::new("/images/native.ext4", "/rootfs.ext4");
         assert_eq!(jail.vmm_path(&rootfs), PathBuf::from("/images/native.ext4"));
         assert_eq!(jail.vmm_file("api.sock"), base.path().join("vm-2/api.sock"));
-        let command = jail.command(&config, 1, 1, None, &[rootfs], &["--x".into()]);
+        let command = jail.command(&config, 1, None, &[rootfs], &["--x".into()], 1 << 30);
         assert_eq!(command.as_std().get_program(), "/usr/bin/minivmm");
         assert_eq!(args(&command), vec!["--x"]);
         jail.remove();
