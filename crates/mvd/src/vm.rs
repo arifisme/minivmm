@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use crate::admission::MemoryReservation;
 use crate::agent::{AgentClient, AgentError, LogLine};
 use crate::cgroup::{Cgroup, CgroupRoot, Limits};
-use crate::jail::{Bind, JailConfig, JailDir};
+use crate::jail::{Bind, JailConfig, JailDir, JailSocket};
 
 pub const VSOCK_SOCKET: &str = "v.sock";
 pub const API_SOCKET: &str = "api.sock";
@@ -314,7 +314,8 @@ pub fn realtime_ns() -> u64 {
 
 pub async fn api_request(socket: &Path, request: &str) -> Result<String, VmError> {
     let exchange = async {
-        let mut stream = UnixStream::connect(socket).await?;
+        let socket = JailSocket::open(socket)?;
+        let mut stream = UnixStream::connect(socket.path()).await?;
         stream.write_all(format!("{request}\n").as_bytes()).await?;
         let mut line = String::new();
         BufReader::new(stream)

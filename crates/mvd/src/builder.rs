@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -10,7 +10,7 @@ use mv_proto::agent::{ErrorKind, FunctionSetup, Reply, Request, Runtime};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentClient, LogLine};
-use crate::jail::{Bind, make_world_readable};
+use crate::jail::{Bind, seal_output};
 use crate::store::{MEMORY_FILE, STATE_FILE};
 use crate::vm::{API_SOCKET, Launcher, VSOCK_SOCKET, VmError, VmmProcess, api_request};
 
@@ -155,11 +155,20 @@ async fn snapshot(process: &VmmProcess) -> Result<(), VmError> {
     Ok(())
 }
 
-fn collect(process: &VmmProcess, dir: &Path) -> io::Result<SnapshotFiles> {
+/// Moves the snapshot out of the jail before checking it, so the VMM can no longer swap the
+/// files, and leaves it readable only by root and `gid` (or everyone with mode 0444).
+fn collect(process: &VmmProcess, dir: &Path, gid: u32, mode: u32) -> io::Result<SnapshotFiles> {
     fs::create_dir_all(dir)?;
     let files = SnapshotFiles::in_dir(dir);
     fs::rename(process.host_file(OUT_MEMORY), &files.memory)?;
     fs::rename(process.host_file(OUT_STATE), &files.state)?;
+    let sealed =
+        seal_output(&files.memory, gid, mode).and_then(|()| seal_output(&files.state, gid, mode));
+    if let Err(err) = sealed {
+        let _ = fs::remove_file(&files.memory);
+        let _ = fs::remove_file(&files.state);
+        return Err(err);
+    }
     Ok(files)
 }
 
@@ -296,9 +305,7 @@ impl Builder {
         }
         drop(agent);
         snapshot(process).await?;
-        let files = collect(process, dir)?;
-        make_world_readable(&files.state)?;
-        make_world_readable(&files.memory)?;
+        collect(process, dir, 0, 0o444)?;
         fs::write(
             dir.join(MANIFEST),
             serde_json::to_vec(manifest).map_err(io::Error::other)?,
@@ -390,10 +397,7 @@ impl Builder {
         };
         drop(agent);
         snapshot(process).await?;
-        let files = collect(process, build.out_dir)?;
-        for file in [&files.state, &files.memory] {
-            fs::set_permissions(file, fs::Permissions::from_mode(0o400))?;
-        }
+        collect(process, build.out_dir, build.uid, 0o440)?;
         Ok(duration_ms)
     }
 }

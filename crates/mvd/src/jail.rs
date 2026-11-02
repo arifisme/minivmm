@@ -1,6 +1,7 @@
 use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
@@ -121,8 +122,57 @@ impl JailDir {
     }
 }
 
-pub fn make_world_readable(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o444))
+fn open_no_follow(path: &Path, flags: libc::c_int) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | flags)
+        .open(path)
+}
+
+fn invalid(path: &Path, what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{} is not {what}", path.display()),
+    )
+}
+
+/// A socket in a jail directory, which the VMM can write to. It is opened without following
+/// symlinks and connected to through `/proc/self/fd`, so a compromised VMM cannot point the
+/// daemon at another VM's socket.
+pub struct JailSocket(fs::File);
+
+impl JailSocket {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = open_no_follow(path, libc::O_PATH)?;
+        if !file.metadata()?.file_type().is_socket() {
+            return Err(invalid(path, "a socket"));
+        }
+        Ok(Self(file))
+    }
+
+    pub fn path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.0.as_raw_fd()))
+    }
+}
+
+/// Takes over a file a VMM wrote after it was moved out of the jail: it must be a plain file
+/// with a single link (not a symlink, FIFO or hard link planted by a compromised VMM), and it
+/// becomes owned by root with the given group and mode.
+pub fn seal_output(path: &Path, gid: u32, mode: u32) -> io::Result<()> {
+    let file = open_no_follow(path, libc::O_NONBLOCK)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(invalid(path, "a regular file"));
+    }
+    if is_root() {
+        std::os::unix::fs::fchown(&file, Some(0), Some(gid))?;
+    }
+    file.set_permissions(fs::Permissions::from_mode(mode))
+}
+
+fn is_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
 }
 
 #[cfg(test)]
@@ -188,5 +238,38 @@ mod tests {
         assert_eq!(args(&command), vec!["--x"]);
         jail.remove();
         assert!(!jail.host_dir().exists());
+    }
+
+    #[test]
+    fn sockets_and_outputs_must_not_be_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("v.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let link = dir.path().join("link.sock");
+        std::os::unix::fs::symlink(&socket, &link).unwrap();
+        let opened = JailSocket::open(&socket).unwrap();
+        std::os::unix::net::UnixStream::connect(opened.path()).unwrap();
+        assert!(JailSocket::open(&link).is_err());
+        assert!(JailSocket::open(dir.path()).is_err());
+
+        let target = dir.path().join("secret");
+        fs::write(&target, b"x").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let planted = dir.path().join("out.state");
+        std::os::unix::fs::symlink(&target, &planted).unwrap();
+        assert!(seal_output(&planted, 0, 0o444).is_err());
+        let linked = dir.path().join("linked");
+        fs::hard_link(&target, &linked).unwrap();
+        assert!(seal_output(&linked, 0, 0o444).is_err());
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let output = dir.path().join("out.mem");
+        fs::write(&output, b"memory").unwrap();
+        let gid = fs::metadata(&output).unwrap().gid();
+        seal_output(&output, gid, 0o440).unwrap();
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o440
+        );
     }
 }

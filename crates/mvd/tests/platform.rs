@@ -534,8 +534,8 @@ fn functions_are_isolated_from_each_other() {
     );
     let beta_snapshot = daemon.data_dir.join("functions/2/rev-1/snapshot.mem");
     let metadata = fs::metadata(&beta_snapshot).unwrap();
-    assert_eq!(metadata.uid(), beta_uid);
-    assert_eq!(metadata.mode() & 0o777, 0o400);
+    assert_eq!((metadata.uid(), metadata.gid()), (0, beta_uid));
+    assert_eq!(metadata.mode() & 0o777, 0o440);
     let alpha_net = fs::read_link(format!("/proc/{alpha_pid}/ns/net")).unwrap();
     assert_ne!(alpha_net, fs::read_link("/proc/self/ns/net").unwrap());
 }

@@ -9,6 +9,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
+use crate::jail::JailSocket;
+
 const MAX_REPLY_HEADER: usize = 64 << 10;
 const MAX_REPLY_PAYLOAD: usize = MAX_RESPONSE_LEN + 4096;
 const MAX_HANDSHAKE_LINE: usize = 64;
@@ -74,7 +76,8 @@ impl AgentClient {
     }
 
     async fn try_connect(uds: &Path, port: u32) -> io::Result<Self> {
-        let stream = UnixStream::connect(uds).await?;
+        let socket = JailSocket::open(uds)?;
+        let stream = UnixStream::connect(socket.path()).await?;
         let (read, mut writer) = stream.into_split();
         writer
             .write_all(format!("CONNECT {port}\n").as_bytes())
