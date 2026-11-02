@@ -229,3 +229,151 @@ These are real but deliberately left as they are, for the reason given with each
   minutes locally without a crash: virtqueue 15.3 M executions, virtio_devices 2.7 M,
   device_registers 2.7 M, api_json 15.5 M, bzimage 29.3 M, snapshot_state 11.1 M. CI
   also fuzzes every target for 60 seconds on each push.
+
+# Platform audit
+
+Adversarial review of the serverless platform (`mvd`, `mv-jailer`, `mv-agent`, `mv-proto`,
+`mvctl`, the Terraform deployment and CI) at `5779c96`, plus the VMM changes made for it
+(vsock, copy-on-write snapshots). Every source file was read. The threat model:
+
+- **Guests are hostile.** Function code runs as root in its VM and can replace the agent or
+  the guest kernel, so everything mvd reads from a guest (frames, log lines, replies) is
+  untrusted input.
+- **A VMM may be compromised** by a guest escape. The jail is meant to contain it: it must not
+  reach other functions' VMs or files, or the host as root.
+- **API clients are trusted** to run code (anyone with the token can deploy), but must not be
+  able to break the daemon by disconnecting, racing deploys or sending large requests.
+
+Severity uses the scale above. No High findings in the guest-facing paths: frame and reply
+sizes are bounded before allocation, archives are extracted with path, type, count and size
+limits, and vsock and snapshot parsing were already fuzzed.
+
+## Findings
+
+### 1. The daemon followed symlinks in VMM-writable jail directories (High)
+
+- **Location:** `crates/mvd/src/builder.rs` (`collect`, then `chmod` of the snapshot files),
+  `crates/mvd/src/agent.rs` and `vm.rs` (connecting to `v.sock` and `api.sock`).
+- **What goes wrong:** each jail directory is owned by the VMM's uid, and the daemon (root)
+  renamed `out.state`/`out.mem` out of it and then changed their mode through the path. A
+  compromised build VMM could make `out.state` a symlink to any host file and have root
+  make it world-readable (base snapshots got mode 0444), or have it bound into later VMs. It
+  could also replace its sockets with symlinks to another VM's sockets, so the daemon would
+  send one function's events to another function's VM.
+- **Resolution (fixed, `e8108b6`):** sockets are opened with `O_PATH | O_NOFOLLOW`, checked to
+  be sockets and connected to through `/proc/self/fd`; snapshot files are moved out first
+  (so the VMM can no longer swap them), then opened with `O_NOFOLLOW`, required to be plain
+  files with one link, and given to root with `fchown`/`fchmod` (group = the function's uid,
+  mode 0440; base snapshots 0444). Test `sockets_and_outputs_must_not_be_symlinks`.
+
+### 2. A client disconnect leaked pool slots (High)
+
+- **Location:** `crates/mvd/src/api.rs` handlers, `crates/mvd/src/pool.rs`.
+- **What goes wrong:** hyper drops a handler's future when its connection closes. An
+  invocation dropped while it held a VM left the pool's busy or starting count raised for
+  good (and a stale entry in `/v1/vms`); after `max_concurrency` disconnects the function
+  answered 429 forever. Deploys and deletes dropped halfway behaved similarly.
+- **Resolution (fixed, `015d783`):** invocations, deploys and deletes run on their own task
+  and finish regardless of the client. New end-to-end test
+  `abandoned_requests_still_release_their_vms` (four requests abandoned after 300 ms against
+  `max_concurrency` 2, then the pool must drain and serve a warm request).
+
+### 3. Queued requests held host CPU reservations (Medium)
+
+- **Location:** `Platform::serve`.
+- **What goes wrong:** the vCPU reservation was taken before waiting for a pool slot, so a
+  burst queued on one function (up to `--queue-timeout`) held CPU admission and made every
+  other function answer 429 "every host CPU is busy".
+- **Resolution (fixed, `b0d9c93`):** the reservation is taken after the request gets a VM
+  slot; a refused request hands its slot back.
+
+### 4. A deploy removed the previous revision under in-flight cold starts (Medium)
+
+- **Location:** `Platform::deploy`, `remove_old_revisions`.
+- **What goes wrong:** the replaced revision's directory was deleted as soon as the new one
+  went live, while requests that had already picked the old revision could still be about to
+  spawn a VM from it; the jailer then failed to bind the missing snapshot and the request got
+  a 502.
+- **Resolution (fixed, `16d86da`):** a replaced revision is marked retired and removed when
+  its last reference drops; stale revision directories are cleaned on deploy and on startup.
+  The Python end-to-end test checks that only the live revision remains.
+
+### 5. API tokens were compared in variable time; an empty token was accepted (Medium)
+
+- **Resolution (fixed, `2b9ac16`, `79ce149`):** tokens are compared through SHA-256 digests
+  without data-dependent branches. Startup refuses an empty or non-printable token, a uid base
+  below 1000 (0 would have run base-snapshot builds as root) or one that leaves no room for
+  function uids, and a non-positive or NaN `--memory-overcommit`; it warns when listening on
+  a non-loopback address without a token. Function ids above 2^24 are refused so uids stay in
+  range. Test `rejects_unsafe_options`.
+
+### 6. Guests controlled log attribution and size (Medium)
+
+- **Location:** `Platform::serve` log callback, `crates/mvd/src/logs.rs`.
+- **What goes wrong:** the request id of each log line came from the guest, so a function
+  could file lines under other requests; and the agent's 16 KiB line limit was the only bound,
+  so a modified guest could store 2000 lines of 64 KiB per function in the daemon.
+- **Resolution (fixed, `ec94080`):** the daemon tags lines with the request it is serving
+  (keeping only whether the guest sent them during a request), truncates them to 16 KiB and
+  keeps at most 4 MiB per function. Test `bounds_line_length_and_total_bytes`.
+
+### 7. A late function response could answer the next request (Medium)
+
+- **Location:** `crates/mv-agent/src/runtime.rs`, `server.rs`.
+- **What goes wrong:** the agent read function stdout continuously into a queue and only
+  consumed it during an invocation, so a second response line (a function that answers
+  twice, or a background thread) was handed to the next request, possibly from another end
+  user, and stray output was logged under the wrong request.
+- **Resolution (fixed, `cad7ffb`):** output queued between invocations is dropped before the
+  next request is sent (non-protocol lines are kept as logs, protocol lines reported). Test
+  `late_responses_never_reach_the_next_request` fails without the change.
+
+### 8. Jail hardening gaps (Low)
+
+- **VMM threads could send any signal** (`tgkill`, `tkill` unrestricted), so a compromised
+  VMM could kill the other VMMs of its function, which share its uid. Both are now limited to
+  the vCPU kick signal (`3f7e891`, test `threads_can_only_send_the_kick_signal`, run for
+  glibc and musl).
+- **The jailer kept inherited descriptors and set no file size limit.** It now closes every
+  descriptor above standard error and limits files the VMM writes to its memory limit
+  (`3c83e0e`).
+- **VMMs were killed by pid** after checking that they had not exited, which could signal a
+  reused pid in unjailed mode; they are now killed through the child handle (`b856ef9`).
+
+### 9. Smaller defects (Low)
+
+- VMM control replies were accepted when the text `"ok":true` appeared anywhere, including
+  inside an error message; they are now parsed (`a53f663`, test
+  `control_replies_must_report_ok`).
+- The agent, which is PID 1, exited (panicking the guest) on any `accept` error; transient
+  errors are now retried (`eb81bc8`).
+- Metric series of deleted functions stayed forever (`5f1b690`).
+- `mvctl` recursed forever on a symlink loop when packaging a directory, and gave up on
+  invocations after 10 minutes although functions may run for 15 (`068545a`).
+- The Terraform deployment put the API token in instance metadata (readable by anyone with
+  `compute.instances.get`) and pasted it unescaped into a shell script. It is now stored in
+  Secret Manager, readable only by the VM's service account, fetched at every boot, and
+  restricted to a header-safe character set (`bdbb4a2`).
+- The CI token had the default write permissions; it is now read-only (`82df244`).
+
+## Accepted
+
+- **No disk quotas.** Code archives and base snapshots of VM shapes nobody uses any more
+  stay on disk; anyone with the token can fill it. Documented in the README.
+- **Build VMs are not counted by admission control.** Deploys are serialized, so at most
+  one build VM (plus a base build) runs at a time.
+- **VMs of one function share a uid.** With the signal restriction above, a compromised VMM
+  can no longer signal its siblings; ptrace and `/proc` are unavailable to it.
+- **A metric series can reappear** when an invocation finishes just after its function was
+  deleted.
+- **The token is in the Terraform state**, which must therefore stay private.
+
+## Verification
+
+- `cargo audit` reports no advisories for the workspace or the fuzz lockfile.
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` (Rust
+  1.99) are clean; every unit, API and agent test passes; the end-to-end suite and
+  benchmarks pass on the CI KVM runner; `terraform fmt -check` and `terraform validate`
+  pass.
+- The VMM's device code did not change in this round; its fuzz targets last ran for 5
+  minutes each after the vsock and snapshot changes (PROGRESS.md) without a crash.

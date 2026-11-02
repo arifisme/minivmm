@@ -78,5 +78,11 @@ snapshot_state 9.1 M. CI fuzzes every target for a minute on each push.
   `pthread_kill` uses `tkill`, so both are in the VMM filter; a stdin that epoll cannot watch
   (`/dev/null`) is treated as closed.
 
+## Platform audit
+A full review after the platform was complete found two High issues (symlinks in jail
+directories, pool slots leaked by client disconnects), five Medium and several Low ones; all
+are fixed or explicitly accepted. Details and the commits are in AUDIT.md under
+"Platform audit".
+
 ## Blockers
 - None.
