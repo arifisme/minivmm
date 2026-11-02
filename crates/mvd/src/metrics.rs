@@ -3,6 +3,21 @@ use prometheus::{
     TextEncoder,
 };
 
+const STARTS: &[&str] = &["cold", "warm", "none"];
+const ERROR_KINDS: &[&str] = &[
+    "function_error",
+    "throttled",
+    "timeout",
+    "launch_failed",
+    "vm_crashed",
+    "runtime_exited",
+    "response_too_large",
+    "agent_error",
+    "bad_request",
+    "internal",
+];
+const THROTTLE_REASONS: &[&str] = &["memory", "host_memory", "cpu", "concurrency"];
+const POOL_STATES: &[&str] = &["idle", "busy", "starting"];
 const LATENCY_BUCKETS: &[f64] = &[
     0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.035, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 1.0, 2.5,
     5.0, 10.0, 30.0,
@@ -141,6 +156,26 @@ impl Metrics {
         }
     }
 
+    /// Drops every series of a deleted function, so they neither linger in the output nor
+    /// accumulate as functions come and go.
+    pub fn forget_function(&self, name: &str) {
+        for start in STARTS {
+            let _ = self.invocations.remove_label_values(&[name, start]);
+            let _ = self.duration.remove_label_values(&[name, start]);
+        }
+        for kind in ERROR_KINDS {
+            let _ = self.errors.remove_label_values(&[name, kind]);
+        }
+        for reason in THROTTLE_REASONS {
+            let _ = self.throttled.remove_label_values(&[name, reason]);
+        }
+        for state in POOL_STATES {
+            let _ = self.pool.remove_label_values(&[name, state]);
+        }
+        let _ = self.timeouts.remove_label_values(&[name]);
+        let _ = self.cold_start.remove_label_values(&[name]);
+    }
+
     pub fn render(&self) -> String {
         let mut buffer = Vec::new();
         let _ = TextEncoder::new().encode(&self.registry.gather(), &mut buffer);
@@ -172,5 +207,11 @@ mod tests {
         ));
         assert!(text.contains(r#"mvd_pool_vms{function="hello",state="idle"} 2"#));
         assert!(text.contains("mvd_host_memory_limit_bytes 1073741824"));
+        metrics
+            .errors
+            .with_label_values(&["hello", "vm_crashed"])
+            .inc();
+        metrics.forget_function("hello");
+        assert!(!metrics.render().contains(r#"function="hello""#));
     }
 }

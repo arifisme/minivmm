@@ -468,9 +468,7 @@ impl Platform {
         }
         let _ = fs::remove_dir_all(self.store.function_dir(id));
         self.logs.forget(name);
-        for state in ["idle", "busy", "starting"] {
-            let _ = self.metrics.pool.remove_label_values(&[name, state]);
-        }
+        self.metrics.forget_function(name);
         tracing::info!(function = %name, "function deleted");
         Ok(())
     }
