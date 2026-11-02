@@ -42,6 +42,32 @@ resource "google_service_account" "host" {
   display_name = "mvd host"
 }
 
+resource "google_project_service" "secretmanager" {
+  service            = "secretmanager.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_secret_manager_secret" "api_token" {
+  secret_id = "${var.name}-api-token"
+
+  replication {
+    auto {}
+  }
+
+  depends_on = [google_project_service.secretmanager]
+}
+
+resource "google_secret_manager_secret_version" "api_token" {
+  secret      = google_secret_manager_secret.api_token.id
+  secret_data = var.api_token
+}
+
+resource "google_secret_manager_secret_iam_member" "host" {
+  secret_id = google_secret_manager_secret.api_token.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.host.email}"
+}
+
 resource "google_compute_instance" "host" {
   name         = "${var.name}-host"
   machine_type = var.machine_type
@@ -72,16 +98,21 @@ resource "google_compute_instance" "host" {
 
   service_account {
     email  = google_service_account.host.email
-    scopes = ["logging-write", "monitoring-write"]
+    scopes = ["cloud-platform"]
   }
 
   metadata = {
     enable-oslogin = "TRUE"
     startup-script = templatefile("${path.module}/bootstrap.sh.tftpl", {
-      repository  = var.repository
-      git_ref     = var.git_ref
-      api_token   = var.api_token
-      mvd_service = file("${path.module}/mvd.service")
+      repository   = var.repository
+      git_ref      = var.git_ref
+      token_secret = google_secret_manager_secret.api_token.id
+      mvd_service  = file("${path.module}/mvd.service")
     })
   }
+
+  depends_on = [
+    google_secret_manager_secret_version.api_token,
+    google_secret_manager_secret_iam_member.host,
+  ]
 }

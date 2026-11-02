@@ -225,9 +225,12 @@ jails and cgroups; leftovers from a crash are cleaned up on the next start.
 ## Deployment
 
 `deploy/` holds Terraform for a single GCP VM with nested virtualization (N2 by default),
-a dedicated network, firewall rules for the API (port 8080) and optionally SSH, and a startup
-script that builds everything from this repository and installs `mvd` as a systemd unit
-(`deploy/mvd.service`).
+a dedicated network, firewall rules for the API (port 8080) and optionally SSH, the API token
+in Secret Manager (readable only by the VM's service account), and a startup script that
+builds everything from this repository and installs `mvd` as a systemd unit
+(`deploy/mvd.service`). The token is fetched on every boot, so rotating it means adding a new
+secret version and restarting the VM. It is still part of the Terraform state, so keep the
+state private.
 
 Create `deploy/terraform.tfvars`:
 
@@ -235,7 +238,7 @@ Create `deploy/terraform.tfvars`:
 project           = "my-project"
 api_allowed_cidrs = ["203.0.113.0/24"]
 ssh_allowed_cidrs = ["203.0.113.0/24"]
-api_token         = "a-long-random-token-of-at-least-24-chars"
+api_token         = "a-long-random-token-of-at-least-24-chars"   # A-Z a-z 0-9 ._~+/=-
 ```
 
 Then:

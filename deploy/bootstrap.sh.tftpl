@@ -1,9 +1,23 @@
 #!/usr/bin/env bash
-# Runs as the instance startup script on every boot; the build only happens once.
+# Runs as the instance startup script on every boot; the build only happens once. The API
+# token is read from Secret Manager on every boot, so it never sits in instance metadata.
 set -euo pipefail
 
+write_token() {
+    local access token
+    access="$(curl -sSf -H 'Metadata-Flavor: Google' \
+        http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token |
+        jq -r .access_token)"
+    token="$(curl -sSf -H "Authorization: Bearer $access" \
+        "https://secretmanager.googleapis.com/v1/${token_secret}/versions/latest:access" |
+        jq -r .payload.data | base64 -d)"
+    install -d -m 0700 /etc/mvd
+    (umask 077 && printf 'MVD_API_TOKEN=%s\n' "$token" > /etc/mvd/mvd.env)
+}
+
 if [[ -x /usr/local/bin/mvd ]]; then
-    systemctl start mvd
+    write_token
+    systemctl restart mvd
     exit 0
 fi
 
@@ -11,6 +25,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -y -q build-essential git curl jq flex bison bc libelf-dev libssl-dev \
     e2fsprogs cpio debootstrap musl-tools
+write_token
 
 if [[ ! -e /dev/kvm ]]; then
     echo "nested virtualization is not enabled on this instance" >&2
@@ -39,9 +54,6 @@ install -d /usr/local/share/mvd/runtimes
 install -m 0444 guest/out/bzImage /usr/local/share/mvd/bzImage
 install -m 0444 guest/out/runtimes/*.ext4 /usr/local/share/mvd/runtimes/
 
-install -d -m 0700 /etc/mvd
-umask 077
-printf 'MVD_API_TOKEN=%s\n' '${api_token}' > /etc/mvd/mvd.env
 cat > /etc/systemd/system/mvd.service <<'UNIT'
 ${mvd_service}
 UNIT

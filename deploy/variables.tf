@@ -50,8 +50,8 @@ variable "api_token" {
   sensitive   = true
 
   validation {
-    condition     = length(var.api_token) >= 24
-    error_message = "Use an API token of at least 24 characters."
+    condition     = can(regex("^[A-Za-z0-9._~+/=-]{24,}$", var.api_token))
+    error_message = "Use an API token of at least 24 characters from A-Z, a-z, 0-9 and ._~+/=-."
   }
 }
 
