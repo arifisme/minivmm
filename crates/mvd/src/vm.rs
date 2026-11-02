@@ -337,7 +337,9 @@ pub async fn api_request(socket: &Path, request: &str) -> Result<String, VmError
         .await
         .map_err(|_| VmError::Api("timed out".into()))?
         .map_err(|e| VmError::Api(e.to_string()))?;
-    if response.contains(r#""ok":true"#) {
+    let ok = serde_json::from_str::<serde_json::Value>(&response)
+        .is_ok_and(|reply| reply["ok"] == serde_json::Value::Bool(true));
+    if ok {
         Ok(response)
     } else {
         Err(VmError::Api(response.trim().to_string()))
@@ -607,6 +609,29 @@ mod tests {
         capture(&b"first\nsecond\npartial"[..], console.clone()).await;
         let lines: Vec<String> = console.lock().unwrap().iter().cloned().collect();
         assert_eq!(lines, ["first", "second", "partial"]);
+    }
+
+    #[tokio::test]
+    async fn control_replies_must_report_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            for reply in [
+                r#"{"ok":true,"state":"running"}"#,
+                r#"{"ok":false,"error":"\"ok\":true"}"#,
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 64];
+                let _ = stream.read(&mut request).await.unwrap();
+                stream
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        assert!(api_request(&path, "{}").await.is_ok());
+        assert!(api_request(&path, "{}").await.is_err());
     }
 
     #[test]
