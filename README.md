@@ -101,6 +101,9 @@ base snapshot (one boot, about a second); later deploys reuse it.
    `{"error":{"type":"...","message":"..."}}`.
 3. Anything written to stderr is captured as log lines for the current request. `reseed` is
    true on the first request after the VM was restored; reseed any user-space RNG then.
+4. Print exactly one response line per request: stdout written while no request is running
+   is discarded before the next request (other lines are kept as logs), so a late answer can
+   never reach another request.
 
 `examples/native` is a complete example in Rust.
 
@@ -320,7 +323,8 @@ a guest takes 1.0 to 1.5 ms on the CI runner. A restored clone needs only the sn
 and, if configured, the (read-only) disk image; no network device is needed.
 
 **Security.** The VMM thread and each vCPU thread install their own seccomp filter (ioctls
-restricted per thread, no executable mappings, sockets only of family `AF_UNIX`); every guest
+restricted per thread, no executable mappings, sockets only of family `AF_UNIX`, no signal
+other than the vCPU kick); every guest
 input (descriptors, packets, registers, snapshot state) is bounds-checked, and the device
 models, virtqueues, vsock packet handling, API parser and snapshot decoder are fuzzed.
 AUDIT.md records an adversarial review of the VMM.
@@ -331,7 +335,10 @@ AUDIT.md records an adversarial review of the VMM.
 - One request per VM at a time (like Lambda); no asynchronous invocation, no streaming
   responses, events and responses up to 6 MiB.
 - The API is plain HTTP with an optional bearer token; there are no users, quotas or TLS.
-- Logs are kept in memory (2000 lines per function) and are lost on restart.
+- Logs are kept in memory (the last 2000 lines or 4 MiB per function) and are lost on
+  restart.
+- There are no disk quotas, and base snapshots of VM shapes that no function uses any more
+  stay in `<data-dir>/base` until removed by hand.
 - Snapshots replay the CPUID and MSRs of the host that built them; move the data directory
   only between identical hosts. A runtime image change triggers a rebuild of every function
   snapshot on startup.

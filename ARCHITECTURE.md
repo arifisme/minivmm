@@ -106,9 +106,9 @@ flowchart TD
 
 - **Base snapshots** are built lazily, once per (runtime, memory size, vCPU count), and
   rebuilt when the kernel or runtime image changes (a manifest records file identities).
-- **Function snapshots** are built on every deploy into `functions/<id>/rev-<n>/`; older
-  revisions are removed once the new one is live. On startup, a function whose runtime image
-  changed is rebuilt from its stored code.
+- **Function snapshots** are built on every deploy into `functions/<id>/rev-<n>/`; a
+  replaced revision is removed once no request can still cold start from it. On startup, a
+  function whose runtime image changed is rebuilt from its stored code.
 - **Memory files** are sparse (all-zero pages are holes) and mapped `MAP_PRIVATE`, so clones
   share every page they do not write through the page cache.
 
@@ -117,8 +117,11 @@ flowchart TD
 - **One VMM process per VM, jailed.** A VMM compromise is confined to a mount namespace whose
   root holds only that VM's snapshot files, rootfs and a private `/dev/kvm` node, an empty
   network namespace, a per-function uid (VMs of different functions cannot signal or read each
-  other), a cgroup with memory, CPU and pid limits, and the VMM's own seccomp filters. The
-  cost is a fork, a few mounts and an exec per cold start (a few milliseconds).
+  other), a cgroup with memory, CPU and pid limits, a file size limit, and the VMM's own
+  seccomp filters. The daemon treats the jail directory as hostile: it never follows symlinks
+  there, opens the VMM's sockets through `O_PATH` descriptors, and moves snapshot files out
+  before checking them and handing them to root. The cost is a fork, a few mounts and an exec
+  per cold start (a few milliseconds).
 - **Copy-on-write restore instead of reading memory.** Restoring maps the memory file instead
   of copying it, so restore time does not grow with guest memory and idle clones cost only
   the pages they touched. The trade-off is that the first touch of each page is a page fault.
@@ -143,6 +146,9 @@ flowchart TD
   runs out, the oldest idle VMs (of any function) are evicted first; only then is the request
   refused with 429. `MemAvailable` below the reserve also refuses new VMs. Reservations are
   conservative because CoW makes real usage much lower; `--memory-overcommit` relaxes them.
+- **Requests outlive their connection.** Invocations, deploys and deletes run on their own
+  task, so a client that disconnects cannot leave a VM, a pool slot or a half-built revision
+  behind.
 - **Scale to zero.** A reaper destroys VMs idle longer than `--idle-timeout`; a function with
   no traffic holds no memory beyond its snapshot files on disk.
 - **SQLite for metadata, files for everything else.** Metadata changes are rare and small;
