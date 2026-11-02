@@ -61,9 +61,24 @@ impl Agent {
         }
     }
 
+    /// Serves connections until accepting fails for good. The agent is PID 1, so a transient
+    /// error (a signal, or a host that gave up before it was accepted) must not end it.
     pub fn serve(&mut self, listener: &Listener) -> io::Result<()> {
         loop {
-            let (reader, writer) = listener.accept()?;
+            let (reader, writer) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             self.logs.attach(writer);
             self.handle_connection(reader);
             self.logs.detach();
