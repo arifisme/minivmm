@@ -358,6 +358,46 @@ fn load_and_init_failures_are_reported() {
     ));
 }
 
+const LATE_FUNCTION: &str = r#"#!/bin/sh
+echo '{"ready":true}'
+n=0
+while read -r line; do
+  n=$((n+1))
+  echo "{\"response\":{\"n\":$n}}"
+  sleep 0.1
+  echo "{\"response\":{\"late\":$n}}"
+done
+"#;
+
+#[test]
+fn late_responses_never_reach_the_next_request() {
+    let agent = Agent::start();
+    let mut client = agent.connect();
+    client.call(
+        Request::Load {
+            function: setup(Runtime::Native, "bootstrap"),
+        },
+        &archive(&[("bootstrap", LATE_FUNCTION, 0o755)]),
+    );
+    assert!(matches!(
+        client.call(Request::Init { timeout_ms: 5000 }, &[]).reply,
+        Reply::Initialized { .. }
+    ));
+    let first = client.invoke("one", "{}");
+    assert_eq!(first.payload, br#"{"n":1}"#);
+    thread::sleep(Duration::from_millis(300));
+    let second = client.invoke("two", "{}");
+    assert_eq!(second.payload, br#"{"n":2}"#);
+    assert!(
+        second
+            .logs
+            .iter()
+            .any(|(id, _, line)| id.is_none() && line.contains("outside an invocation")),
+        "{:?}",
+        second.logs
+    );
+}
+
 #[test]
 fn hung_functions_time_out() {
     let agent = Agent::start();

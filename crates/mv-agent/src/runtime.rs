@@ -343,6 +343,28 @@ impl RuntimeProcess {
         }
     }
 
+    /// Drops what the function printed while no request was running, so a late or extra
+    /// response cannot be handed to the next request.
+    pub fn discard_stale_output(&mut self) {
+        while let Ok(line) = self.lines.try_recv() {
+            match line {
+                LineRead::Line(bytes) => match RuntimeLine::parse(&bytes) {
+                    Some(_) => self.logs.log(
+                        LogStream::Agent,
+                        "discarded a protocol line printed outside an invocation",
+                    ),
+                    None => self
+                        .logs
+                        .log(LogStream::Stdout, &String::from_utf8_lossy(&bytes)),
+                },
+                LineRead::TooLong => self
+                    .logs
+                    .log(LogStream::Agent, "dropped an output line that was too long"),
+                LineRead::Eof => break,
+            }
+        }
+    }
+
     pub fn kill(&mut self) {
         if !self.exited {
             // SAFETY: signalling the process group created for the function.

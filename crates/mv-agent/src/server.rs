@@ -275,6 +275,7 @@ impl Agent {
             })?;
         let timeout = Duration::from_millis(deadline_ms.saturating_sub(now_ms())) + INVOKE_GRACE;
         let reseed = std::mem::take(&mut self.reseed_pending);
+        process.discard_stale_output();
         self.logs.set_request(Some(request_id.to_string()));
         let started = Instant::now();
         let outcome = process.invoke(request_id, deadline_ms, reseed, &event, timeout);
