@@ -23,6 +23,8 @@ use crate::pool::{Busy, Lease, Pool};
 use crate::store::{CODE_FILE, FunctionRecord, Store};
 use crate::vm::{API_SOCKET, Invocation, Launcher, MicroVm, VmError, VmFailure, api_request};
 
+/// Function ids map to uids above `uid_base`, so they are capped to keep uids in range.
+pub const MAX_FUNCTION_ID: u32 = 1 << 24;
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(10);
 const MIN_REAP_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_REAP_INTERVAL: Duration = Duration::from_secs(1);
@@ -336,6 +338,9 @@ impl Platform {
             Some(record) => record.id,
             None => self.store.allocate_id()?,
         };
+        if !(1..=i64::from(MAX_FUNCTION_ID)).contains(&id) {
+            return Err(PlatformError::Internal("no function ids are left".into()));
+        }
         let now = timestamp();
         let mut record = FunctionRecord {
             id,

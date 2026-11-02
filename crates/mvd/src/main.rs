@@ -104,7 +104,32 @@ fn admission_limits(options: &Options) -> Limits {
     }
 }
 
+const MIN_UID_BASE: u32 = 1000;
+
+fn check_options(options: &Options) -> anyhow::Result<()> {
+    if let Some(token) = &options.api_token
+        && (token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()))
+    {
+        bail!("the API token must be non-empty printable ASCII without spaces");
+    }
+    if !(options.memory_overcommit.is_finite() && options.memory_overcommit > 0.0) {
+        bail!("--memory-overcommit must be a positive number");
+    }
+    let max_uid_base = u32::MAX - 1 - platform::MAX_FUNCTION_ID;
+    if !(MIN_UID_BASE..=max_uid_base).contains(&options.uid_base) {
+        bail!("--uid-base must be between {MIN_UID_BASE} and {max_uid_base}");
+    }
+    if options.api_token.is_none() && !options.listen.ip().is_loopback() {
+        tracing::warn!(
+            "listening on {} without an API token: anyone who can reach it can run code",
+            options.listen
+        );
+    }
+    Ok(())
+}
+
 async fn run(options: Options) -> anyhow::Result<()> {
+    check_options(&options)?;
     let jailer = match &options.jailer {
         Some(path) => path.clone(),
         None => default_jailer()?,
@@ -217,6 +242,34 @@ async fn main() -> std::process::ExitCode {
         Err(err) => {
             tracing::error!("{err:#}");
             std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    fn options(extra: &[&str]) -> Options {
+        let base = ["mvd", "--kernel", "k", "--runtime-dir", "r", "--vmm", "v"];
+        Options::try_parse_from(base.iter().chain(extra)).unwrap()
+    }
+
+    #[test]
+    fn rejects_unsafe_options() {
+        assert!(check_options(&options(&[])).is_ok());
+        assert!(check_options(&options(&["--api-token", "long-enough-token"])).is_ok());
+        for bad in [
+            &["--api-token", ""][..],
+            &["--api-token", "has space"],
+            &["--uid-base", "0"],
+            &["--uid-base", "4294967000"],
+            &["--memory-overcommit", "0"],
+            &["--memory-overcommit", "NaN"],
+        ] {
+            assert!(check_options(&options(bad)).is_err(), "{bad:?}");
         }
     }
 }
