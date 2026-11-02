@@ -334,6 +334,41 @@ fn timeouts_kill_the_vm() {
 }
 
 #[test]
+fn abandoned_requests_still_release_their_vms() {
+    let Some(artifacts) = artifacts("abandoned") else {
+        return;
+    };
+    let daemon = Daemon::start("abandoned", artifacts, &[]);
+    daemon.deploy_ok(
+        "patient",
+        native_config(json!({"max_concurrency": 2})),
+        daemon.native_code(),
+    );
+    let impatient = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    for _ in 0..4 {
+        let sent = impatient
+            .post(format!("{}/v1/functions/patient/invoke", daemon.url))
+            .body(json!({"action": "sleep", "ms": 1000}).to_string())
+            .send();
+        assert!(sent.is_err(), "the client should give up first");
+    }
+    daemon.wait_until(
+        "abandoned requests to finish",
+        Duration::from_secs(10),
+        || {
+            let pool = &daemon.get("/v1/functions/patient").body["pool"];
+            pool["busy"] == 0 && pool["starting"] == 0
+        },
+    );
+    let reply = daemon.invoke_ok("patient", json!({"action": "echo"}));
+    assert_eq!(reply.header("x-mv-start").as_deref(), Some("warm"));
+    daemon.assert_no_leaks();
+}
+
+#[test]
 fn guest_crashes_fail_only_their_request() {
     let Some(artifacts) = artifacts("guest_crash") else {
         return;

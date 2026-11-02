@@ -159,10 +159,27 @@ async fn describe(State(state): State<AppState>, Path(name): Path<String>) -> Re
     result(state.platform.describe(&name))
 }
 
+/// Runs platform work on its own task, so that it finishes and releases its VMs and pool
+/// slots even when the client disconnects and the handler future is dropped.
+async fn detached<T: Send + 'static>(
+    work: impl Future<Output = T> + Send + 'static,
+) -> Result<T, Response> {
+    tokio::spawn(work).await.map_err(|err| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("the request failed: {err}"),
+            Vec::new(),
+        )
+    })
+}
+
 async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    match state.platform.delete(&name).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => platform_error(err),
+    let platform = state.platform.clone();
+    match detached(async move { platform.delete(&name).await }).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(err)) => platform_error(err),
+        Err(response) => response,
     }
 }
 
@@ -237,9 +254,11 @@ async fn deploy(
             Vec::new(),
         );
     }
-    match state.platform.deploy(&name, config, code.to_vec()).await {
-        Ok(info) => (StatusCode::CREATED, Json(info)).into_response(),
-        Err(err) => platform_error(err),
+    let platform = state.platform.clone();
+    match detached(async move { platform.deploy(&name, config, code.to_vec()).await }).await {
+        Ok(Ok(info)) => (StatusCode::CREATED, Json(info)).into_response(),
+        Ok(Err(err)) => platform_error(err),
+        Err(response) => response,
     }
 }
 
@@ -293,7 +312,12 @@ fn invoke_headers(report: &InvokeReport) -> HeaderMap {
 }
 
 async fn invoke(State(state): State<AppState>, Path(name): Path<String>, body: Bytes) -> Response {
-    let mut report = state.platform.invoke(&name, body.to_vec()).await;
+    let platform = state.platform.clone();
+    let mut report =
+        match detached(async move { platform.invoke(&name, body.to_vec()).await }).await {
+            Ok(report) => report,
+            Err(response) => return response,
+        };
     let headers = invoke_headers(&report);
     let result = std::mem::replace(
         &mut report.result,
