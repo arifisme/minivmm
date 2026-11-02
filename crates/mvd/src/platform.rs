@@ -873,13 +873,10 @@ impl Platform {
         self.track(&vm, "busy");
         let logs = self.logs.clone();
         let function = name.to_string();
+        let request_id = report.request_id.clone();
         let mut on_log = move |line: LogLine| {
-            logs.push(
-                &function,
-                line.request_id.as_deref(),
-                stream_name(line.stream),
-                &line.line,
-            )
+            let request_id = line.request_id.as_ref().map(|_| request_id.as_str());
+            logs.push(&function, request_id, stream_name(line.stream), &line.line)
         };
         let timeout = Duration::from_millis(config.timeout_ms);
         let outcome = vm
